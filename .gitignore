@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+.pytest_cache/
+logs/
+.DS_Store
+
+# FMS 런타임 데이터 (site/맵 저장소, FMS_DATA_ROOT 기본값)
+fms_server/maps/

@@ -1,0 +1,11 @@
+# FMS 서버 (fms_server/) + 공용 계약 (common/). Python 3.11+.
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+pydantic>=2.6             # common/schemas.py, map_model.py
+paho-mqtt>=2.1            # 로봇·승강기 MQTT
+numpy>=1.26               # mapkit (맵 굽기)
+Pillow>=10.0              # 맵 PNG 입출력
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9   # 맵 업로드 (멀티파트)
+pytest>=8.0               # fms_server/tests
+httpx>=0.27               # fastapi.testclient
