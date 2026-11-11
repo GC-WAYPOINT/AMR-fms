@@ -171,7 +171,8 @@ def dispatch_job(site_id: str, job_id: str, body: DispatchRequest, request: Requ
 def cancel_job(site_id: str, job_id: str, request: Request) -> JobOut:
     _job_in_site(request, site_id, job_id)
     try:
-        job = _coordinator(request).cancel(job_id)
+        from fms_server.api.events import actor_of
+        job = _coordinator(request).cancel(job_id, actor=actor_of(request))
     except JobError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     return JobOut.of(job)

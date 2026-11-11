@@ -340,6 +340,8 @@ def activate_map(site_id: str, map_id: str, body: ActivateRequest, request: Requ
     notified: list[str] = []
     if body.notify:
         notified = _coordinator(request).notify_map_activated(site_id, map_id)
+    from fms_server.api.events import record
+    record(request, "map.activated", site_id=site_id, map_id=map_id, version=body.version)
     return ActivateResultOut(
         site_id=site_id, map_id=map_id, version=body.version, notified_robots=notified
     )

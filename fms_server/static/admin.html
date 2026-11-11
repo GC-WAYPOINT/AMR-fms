@@ -14,6 +14,7 @@
 <script src="/static/elevators.js" defer></script>
 <script src="/static/elevator-status.js" defer></script>
 <script src="/static/jobs.js" defer></script>
+<script src="/static/events.js" defer></script>
 </head>
 <body>
 <aside class="sidebar">
@@ -28,6 +29,7 @@
     <button data-page="maps"><span>▱</span>맵 관리</button>
     <button data-page="locations"><span>⌖</span>목적지·도킹</button>
     <button data-page="elevators"><span>⇅</span>엘리베이터</button>
+    <button data-page="events"><span>☰</span>이력</button>
     <button data-page="settings"><span>⚙</span>현장 설정</button>
   </nav>
   <div class="sidebar-bottom"><span class="status-dot" id="serverDot"></span><span id="serverStatus">서버 연결 중</span></div>
@@ -182,6 +184,19 @@
       <div class="table-wrap"><table><thead><tr><th>승강기</th><th>현재 층</th><th>동작 상태</th><th>목표 층</th><th>문 상태</th><th>수신 상태</th></tr></thead><tbody id="elevatorStatusRows"><tr><td colspan="6" class="empty-row">운행 상태를 확인합니다.</td></tr></tbody></table></div>
     </section>
     <div id="elevatorBody"></div>
+  </section>
+  <section id="page-events" class="page content-page" hidden>
+    <div class="page-heading"><div><h2>이력</h2><p>작업·로봇·교통·승강기·운영 조작의 이벤트 로그입니다. 보존 기간이 지나면 지워집니다.</p></div></div>
+    <div class="panel"><form id="eventFilter">
+      <label>분류<select name="kind"></select></label>
+      <label>심각도<select name="severity"><option value="">전체</option><option value="warning">주의</option><option value="error">오류</option></select></label>
+      <label>로봇 ID<input name="robot" placeholder="AMR-001"></label>
+      <label>작업 ID<input name="job" placeholder="hq-J0001"></label>
+      <label>표시 건수<select name="limit"><option>200</option><option>500</option><option>2000</option></select></label>
+      <label class="check"><input type="checkbox" name="allSites"> 모든 현장</label>
+      <button class="primary">조회</button><button type="button" id="eventReset">필터 초기화</button>
+    </form><p id="eventCount" class="muted"></p></div>
+    <div class="table-wrap"><table><thead><tr><th>시각</th><th>이벤트</th><th>심각도</th><th>로봇</th><th>작업</th><th>조작자</th><th>내용</th></tr></thead><tbody id="eventRows"></tbody></table></div>
   </section>
   <section id="page-settings" class="page content-page" hidden>
     <div class="page-heading"><div><h2>현장 설정</h2><p>현장을 등록하고 서버 연결 상태를 확인합니다.</p></div></div>

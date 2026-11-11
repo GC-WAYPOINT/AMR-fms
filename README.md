@@ -9,7 +9,7 @@ AMR 플릿 관리 서버(FMS). 로봇의 MQTT 상태를 모으고 현장·맵·�
 | `common/` | 프로토콜 계약 원본: `schemas.py`(로봇 메시지), `map_model.py`, `map_annotations.py`, `elevator_proto.py` |
 | `tools/elevator_sim.py` | 외부 가상 승강기 (`FMS_ELEVATOR_SIM=0` 일 때만) |
 | `maps/` | 테스트 고정 맵 (`641931de9eae7cecb34d5765`, `gen_loop`). AMR-simulator `maps/` 에서 복사. 테스트가 리포 루트 기준 상대경로로 읽는다 |
-| `docs/` | [개발 구조](docs/architecture.md), [교통 제어](docs/traffic.md), [승강기](docs/elevators.md), [픽업스테이션 설계](docs/pickup-station.md), [알려진 문제](docs/known-issues.md) |
+| `docs/` | [개발 구조](docs/architecture.md), [교통 제어](docs/traffic.md), [승강기](docs/elevators.md), [픽업스테이션 설계](docs/pickup-station.md), [알려진 문제](docs/known-issues.md), [로드맵](docs/roadmap.md) |
 
 ## 설치와 실행 (리포 루트)
 

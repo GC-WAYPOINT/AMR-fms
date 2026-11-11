@@ -1,5 +1,5 @@
 'use strict';
-// 읽기 전용 로봇 상세. 수신 갱신 시 접힘 상태·스크롤·키보드 포커스를 유지한다.
+// 로봇 상세와 즉시 명령(일시정지·재개·오류 해제). 수신 갱신 시 접힘 상태·스크롤·키보드 포커스를 유지한다.
 window.robotDetails = (()=>{
   const cards=new WeakMap();
   const number=(n,places=2,unit='')=>Number.isFinite(n)?`${n.toFixed(places)}${unit}`:'—';
@@ -38,9 +38,19 @@ window.robotDetails = (()=>{
     function detail(label){const row=el('div'),value=el('dd');row.append(el('dt',label),value);diagnosticRows.append(row);return value;}
     const x=detail('X 좌표'),y=detail('Y 좌표'),heading=detail('방향'),map=detail('배정 맵'),sync=detail('맵 동기화'),version=detail('보고 맵 버전'),score=detail('위치 추정 점수'),size=detail('로봇 크기'),order=detail('오더 ID');
     const updated=el('footer',undefined,'rd-updated');
-    root.append(header,status,notice,battery,task,cargo,facts,errors,diagnostics,updated);
+    // 즉시 명령. 상태에 맞지 않는 버튼은 render 가 비활성으로 둔다.
+    const controls=el('section',undefined,'rd-controls');controls.setAttribute('aria-label','로봇 즉시 명령');
+    function command(text,path,done){
+      const b=el('button',text);b.type='button';
+      b.onclick=()=>run(async()=>{await request(`/api/v1/robots/${enc(card.robotId)}/${path}`,'POST',{});notify(`${card.robotId}: ${done}`);});
+      controls.append(b);return b;
+    }
+    const pauseButton=command('일시정지','pause','일시정지 명령을 보냈습니다.'),resumeButton=command('재개','resume','재개 명령을 보냈습니다.'),resetButton=command('오류 해제','reset-error','오류 해제 명령을 보냈습니다.');
+    const historyButton=el('button','이력');historyButton.type='button';historyButton.onclick=()=>window.eventsView?.show({robot:card.robotId});
+    controls.append(historyButton);
+    root.append(header,status,notice,battery,task,cargo,facts,errors,controls,diagnostics,updated);
     container.replaceChildren(root);
-    const card={root,name,connection,status,notice,charge,chargeState,batteryTrack,batteryFill,
+    const card={root,name,connection,status,notice,charge,chargeState,batteryTrack,batteryFill,pauseButton,resumeButton,resetButton,robotId:null,
       taskTitle,taskStep,progress,deliveryButton,taskLabel,mode,localization,speed,errors,diagnostics,cargo,cargoKey:null,
       x,y,heading,map,sync,version,score,size,order,updated,errorKey:null};
     cards.set(container,card);return card;
@@ -58,7 +68,13 @@ window.robotDetails = (()=>{
     const fatal=s?.errors?.some(e=>e.level==='FATAL');
     const tone=s?.state==='EMERGENCY'||fatal||s?.state==='ERROR'?'danger':!s||!connected||s?.paused||s?.mode==='MANUAL'?'warning':s?.state==='BUSY'?'moving':'normal';
     c.root.dataset.tone=tone;
-    set(c.name,robot.robot_id);
+    set(c.name,robot.robot_id);c.robotId=robot.robot_id;
+    // LOCAL 일시정지는 FMS 가 풀 수 없다 (프로토콜 규칙).
+    c.pauseButton.disabled=!connected||!s||s.paused;
+    c.resumeButton.disabled=!connected||!s||!s.paused||s.pause_source!=='FMS';
+    c.resumeButton.title=s?.paused&&s.pause_source==='LOCAL'?'로봇에서 건 일시정지는 로봇에서 해제해야 합니다.':'';
+    c.resetButton.disabled=!connected||!s||!(s.state==='ERROR'||s.errors?.length);
+    if(robot.display_status)c.root.dataset.status=robot.display_status;
     set(c.connection,connectionNames[robot.liveness]||robot.liveness||'상태 미수신');
     c.connection.dataset.online=connected?'true':'false';
     set(c.status,!s?'상태 수신 대기':s.state==='EMERGENCY'?'비상정지':s.state==='ERROR'?'오류':s.paused?'일시정지':statusNames[s.sub_state||s.state]||s.state);

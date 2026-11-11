@@ -48,6 +48,9 @@ from fms_server.sites import SiteRegistry
 from fms_server.task import JobCoordinator, JobStore
 from fms_server.locker import LockerBridge
 from fms_server.api.locker import router as locker_router
+from fms_server.api.events import router as events_router
+from fms_server.events import EventLog
+from fms_server.robot_events import RobotEventRecorder
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,12 +62,14 @@ log = logging.getLogger("fms.main")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     registry = SiteRegistry(settings.data_root)
+    events = EventLog(settings.data_root, retention_days=settings.event_retention_days)
     fleet = Fleet(stale_after=settings.robot_stale_after)
     mqtt = FmsMqttClient(fleet, settings)
     coordinator = SiteCoordinator(fleet, registry, mqtt, settings.public_url)
     broadcaster = FleetBroadcaster(fleet, registry)
     jobs = JobStore(settings.data_root)
-    elevator_ctl = ElevatorController(settings)
+    elevator_ctl = ElevatorController(settings, events=events)
+    robot_events = RobotEventRecorder(fleet, registry, events)
 
     def elevator_store():
         # 테스트가 registry/data_root 를 바꾸고 app.state.elevators 를 비우면 다시 만든다
@@ -73,20 +78,22 @@ async def lifespan(app: FastAPI):
         return app.state.elevators
 
     job_coordinator = JobCoordinator(fleet, registry, jobs, mqtt, elevators=elevator_store,
-                                     elevator_ctl=elevator_ctl, site_coordinator=coordinator)
+                                     elevator_ctl=elevator_ctl, site_coordinator=coordinator, events=events)
     elevator_ctl.add_listener(job_coordinator.on_elevator_state)
     elevator_sim = (BuiltinElevatorSim(settings, elevator_store, lambda: app.state.sites)
                     if settings.elevator_sim else None)
 
-    allocator = JobAllocator(job_coordinator)
+    allocator = JobAllocator(job_coordinator, ticks=[("robot-events", robot_events.tick)])
     cargo = CargoStore(settings.data_root)
     app.state.cargo = cargo
-    locker = LockerBridge(registry, fleet, jobs, job_coordinator, mqtt, settings.data_root, cargo=cargo)
+    locker = LockerBridge(registry, fleet, jobs, job_coordinator, mqtt, settings.data_root, cargo=cargo, events=events)
     app.state.locker = locker
     app.state.presets = PresetStore(settings.data_root)
     app.state.allocator = allocator
 
     app.state.settings = settings
+    app.state.events = events
+    app.state.robot_events = robot_events
     app.state.sites = registry
     app.state.fleet = fleet
     app.state.mqtt = mqtt
@@ -97,6 +104,9 @@ async def lifespan(app: FastAPI):
     app.state.elevator_ctl = elevator_ctl
     app.state.elevator_sim = elevator_sim
 
+    events.start()
+    events.record("server.start")
+    robot_events.start()
     broadcaster.start()
     coordinator.start()
     job_coordinator.start()
@@ -119,6 +129,9 @@ async def lifespan(app: FastAPI):
         job_coordinator.stop()
         coordinator.stop()
         await broadcaster.stop()
+        robot_events.stop()
+        events.record("server.stop")
+        events.stop()
         log.info("FMS 서버 종료")
 
 
@@ -135,6 +148,7 @@ app.include_router(pickup_stations_router)
 app.include_router(cargo_router)
 app.include_router(elevators_router)
 app.include_router(locker_router)
+app.include_router(events_router)
 
 _ADMIN_HTML = Path(__file__).parent / "static" / "admin.html"
 app.mount("/static", StaticFiles(directory=_ADMIN_HTML.parent), name="static")

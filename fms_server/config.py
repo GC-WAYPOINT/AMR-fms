@@ -61,6 +61,9 @@ class Settings:
     # 가상 엘리베이터를 FMS 안에서 돌린다 (기본 켜짐). 실제 제어기나 외부 tools/elevator_sim.py 를 쓸 때만 0.
     elevator_sim: bool = True
 
+    # 이벤트 로그(events.db) 보존 기간 (일). 0 이하면 지우지 않는다.
+    event_retention_days: float = 30.0
+
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
@@ -73,6 +76,7 @@ class Settings:
             robot_stale_after=_env_float("FMS_ROBOT_STALE_AFTER", cls.robot_stale_after),
             mqtt_required=_env_str("FMS_MQTT_REQUIRED", "0") not in ("0", "", "false", "False"),
             elevator_sim=_env_str("FMS_ELEVATOR_SIM", "1") not in ("0", "false", "False", "no", "off"),
+            event_retention_days=_env_float("FMS_EVENT_RETENTION_DAYS", cls.event_retention_days),
         )
 
 

@@ -41,8 +41,9 @@ class CarState:
 
 
 class ElevatorController:
-    def __init__(self, settings, *, stale_after: float = 5.0) -> None:
+    def __init__(self, settings, *, stale_after: float = 5.0, events=None) -> None:
         self._settings = settings
+        self.events = events
         self._stale_after = stale_after
         self._lock = threading.RLock()
         self._cars: dict[str, CarState] = {}
@@ -126,7 +127,10 @@ class ElevatorController:
     # -- 임대 --
     def acquire(self, elevator_id: str, owner: str) -> bool:
         with self._lock:
+            new = elevator_id not in self._leases
             cur = self._leases.setdefault(elevator_id, owner)
+            if new and self.events is not None:
+                self.events.record("elevator.lease", job_id=owner, elevator_id=elevator_id)
             return cur == owner
 
     def lease_owner(self, elevator_id: str) -> Optional[str]:
@@ -137,6 +141,8 @@ class ElevatorController:
         with self._lock:
             if self._leases.get(elevator_id) == owner:
                 del self._leases[elevator_id]
+                if self.events is not None:
+                    self.events.record("elevator.release", job_id=owner, elevator_id=elevator_id)
 
     # -- 명령 --
     def _send(self, elevator_id: str, body: dict) -> None:

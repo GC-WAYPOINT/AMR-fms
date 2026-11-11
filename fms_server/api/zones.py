@@ -77,6 +77,9 @@ def _edit_locked(request, site_id, map_id, version, zone_id, zone=None, *, creat
     except (SiteError, MapStoreError) as exc:
         raise HTTPException(422, str(exc)) from None
     notified = request.app.state.coordinator.notify_map_activated(site_id, map_id)
+    from fms_server.api.events import record
+    record(request, 'zone.created' if create else 'zone.deleted' if zone is None else 'zone.updated',
+           site_id=site_id, map_id=map_id, zone_id=zone_id, version=result.version)
     return {'zone_id': zone_id, 'version': result.version, 'warnings': result.warnings,
             'notified_robots': notified}
 

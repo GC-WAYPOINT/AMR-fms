@@ -450,6 +450,7 @@ class JobCoordinator:
         elevators=None,          # ElevatorStore 또는 그걸 돌려주는 callable (다층 job 용)
         elevator_ctl=None,       # ElevatorController (다층 job 용)
         site_coordinator=None,   # SiteCoordinator: 층을 옮긴 로봇에 바로 SET_MAP 을 보낸다 (없으면 다음 state 때)
+        events=None,             # EventLog (없으면 기록하지 않는다)
     ) -> None:
         self._fleet = fleet
         self._registry = registry
@@ -458,11 +459,28 @@ class JobCoordinator:
         self._elevators_src = elevators
         self._ctl = elevator_ctl
         self._site_coordinator = site_coordinator
+        self._events = events
         self._unsubscribe = None
         self._lock = threading.RLock()
         self._reservations: dict[str, str] = {}
         from fms_server.traffic import TrafficController
-        self._traffic = TrafficController(registry, fleet, store)
+        self._traffic = TrafficController(registry, fleet, store, events=events)
+
+    @property
+    def events(self):
+        return self._events
+
+    def _event(self, kind: str, job: Optional["Job"] = None, severity: str = "info", **data) -> None:
+        """이벤트 로그에 남긴다 (큐에 넣기만 한다). 로그가 없으면 아무것도 안 한다."""
+        if self._events is None:
+            return
+        if job is not None:
+            data.setdefault("site_id", job.site_id)
+            data.setdefault("robot_id", job.robot_id)
+            data.setdefault("job_id", job.job_id)
+            if job.preset_name:
+                data.setdefault("preset", job.preset_name)
+        self._events.record(kind, severity=severity, **data)
 
     @property
     def traffic(self):
@@ -470,7 +488,7 @@ class JobCoordinator:
         if (self._traffic.registry is not self._registry or self._traffic.fleet is not self._fleet
                 or self._traffic.jobs is not self._store):
             from fms_server.traffic import TrafficController
-            self._traffic = TrafficController(self._registry, self._fleet, self._store)
+            self._traffic = TrafficController(self._registry, self._fleet, self._store, events=self._events)
         return self._traffic
 
     @property
@@ -597,6 +615,7 @@ class JobCoordinator:
             job.error = f"오더 전송 확인 필요: {exc}"
             self._store.save(job)
         log.info("job 디스패치: %s -> %s (노드 %d개)", job_id, target_robot, len(order.nodes))
+        self._event("job.assigned", job, nodes=len(order.nodes))
         return job
 
     # -- 다층 job ----------------------------------------------------
@@ -632,6 +651,7 @@ class JobCoordinator:
         job.touch()
         self._store.save(job)
         log.info("다층 job 디스패치: %s -> %s (stage %d개)", job.job_id, robot_id, len(plan))
+        self._event("job.assigned", job, stages=len(plan))
         self._step_multi(job)
         return job
 
@@ -729,6 +749,8 @@ class JobCoordinator:
             if state.order_id == oid:
                 if not sd.get("ack"):
                     sd["ack"] = True
+                    if not job.acknowledged:
+                        self._event("job.working", job)
                     job.status = JobStatus.WORKING
                     job.acknowledged = True
                 self._stage_progress(job, state)
@@ -916,7 +938,7 @@ class JobCoordinator:
             self._store.save(job)
 
     @_serialized
-    def cancel(self, job_id: str) -> Job:
+    def cancel(self, job_id: str, *, actor: Optional[str] = None, reason: Optional[str] = None) -> Job:
         job = self._store.get(job_id)
         if job.status.terminal or job.status == JobStatus.CANCELING:
             raise JobError(f"job {job_id} 는 이미 종료됐다 ({job.status.value})")
@@ -937,6 +959,9 @@ class JobCoordinator:
         job.touch()
         self._store.save(job)
         log.info("job 취소: %s", job_id)
+        self._event("job.cancel_requested", job, actor=actor, reason=reason)
+        if job.status == JobStatus.CANCELED:
+            self._event("job.canceled", job, actor=actor)
         return job
 
     @_serialized
@@ -1042,6 +1067,7 @@ class JobCoordinator:
                     done += 1
             if first_ack:
                 self._store.save(job)
+                self._event("job.working", job)
             if done != job.done_commands:
                 job.done_commands = done
                 job.touch()
@@ -1071,3 +1097,6 @@ class JobCoordinator:
         job.touch()
         self._store.save(job)
         log.info("job %s -> %s%s", job.job_id, status.value, f" ({error})" if error else "")
+        self._event(f"job.{status.value}", job,
+                    "error" if status == JobStatus.FAILED else "info", error=error,
+                    done_commands=job.done_commands, total_commands=len(job.commands))

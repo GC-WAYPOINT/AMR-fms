@@ -67,8 +67,9 @@ def _write(path, data):
 
 
 class LockerBridge:
-    def __init__(self, registry, fleet, jobs, coordinator, mqtt, data_root, cargo=None):
+    def __init__(self, registry, fleet, jobs, coordinator, mqtt, data_root, cargo=None, events=None):
         self.registry, self.fleet, self.jobs = registry, fleet, jobs
+        self.events = events
         self.coordinator, self.mqtt = coordinator, mqtt
         self.cargo = cargo or CargoStore(data_root)
         self.lock = coordinator.lock
@@ -147,6 +148,11 @@ class LockerBridge:
             timeline = d.setdefault("timeline", [])
             if not timeline or timeline[-1]["mark"] != mark:
                 timeline.append({"mark": mark, "phase": d["phase"], "index": d.get("index", 0), "at": now})
+                if self.events is not None:
+                    self.events.record("delivery.phase", site_id=(d.get("config") or {}).get("site_id"),
+                                       robot_id=d.get("robot_id"), job_id=d.get("job_id"),
+                                       severity="warning" if d["phase"] in ("blocked", "failed") else "info",
+                                       phase=d["phase"], index=d.get("index", 0), error=d.get("error"))
         _write(self.path, self.deliveries)
 
     def start(self):

@@ -675,3 +675,11 @@ tr.delivery-child td:first-child { padding-left:34px; }
 .elevator-live tr[data-fresh=false] .elev-live-floor {color:#9eafc2;}
 
 .layer-options .layer-action { margin-left: auto; padding: 1px 8px; font-size: 12px; border-radius: 6px; }
+
+/* 로봇 상세 즉시 명령 */
+.rd-controls { display:flex; flex-wrap:wrap; gap:6px; margin:10px 0; }
+.rd-controls button { flex:1 1 auto; padding:6px 8px; }
+.rd-controls button:disabled { opacity:.45; cursor:not-allowed; }
+tr.bad td { color:#ffb2b8; }
+tr.warn td { color:#ffd78a; }
+label.check { display:flex; flex-direction:row; align-items:center; gap:6px; }

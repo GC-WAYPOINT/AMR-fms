@@ -6,7 +6,7 @@ const app = {
   page:'map', sites:[], site:null, detail:null, map:null, locations:[], pickupStations:[], cargo:null, robots:new Map(), jobs:[], steps:[], edit:null, selection:null, mapToken:0, siteToken:0
 };
 const titles = {
-  map:'실시간 맵', robots:'로봇', jobs:'작업 게시판', presets:'작업 프리셋', maps:'맵 관리', locations:'목적지·도킹', elevators:'엘리베이터', settings:'현장 설정'
+  map:'실시간 맵', robots:'로봇', jobs:'작업 게시판', presets:'작업 프리셋', maps:'맵 관리', locations:'목적지·도킹', elevators:'엘리베이터', settings:'현장 설정', events:'이력'
 };
 const types = {
   station:'작업 지점', charger:'충전소', parking:'주차 지점', waypoint:'경유점', pickup:'픽업 지점', tray_return:'반납 지점', other:'기타'
@@ -366,6 +366,8 @@ function renderJobs() {
       if(!confirm(`${j.job_id} 작업을 삭제할까요?`))return;await request(`${siteURL()}/jobs/${enc(j.job_id)}`,'DELETE');await refreshSite();
     },'danger'));
     if(j.status==='pending')actions.push(button('취소',async()=>{await request(`${siteURL()}/jobs/${enc(j.job_id)}/cancel`,'POST',{});await refreshSite();}));
+    window.opsUI?.jobActions?.(j,actions);
+    actions.push(button('이력',()=>window.eventsView?.show({job:j.job_id})));
     row(tb,[j.preset_name?`${j.job_id} · ${j.preset_name}`:j.job_id,j.status==='pending'&&j.auto_assign?'자동 배정 대기':label(j.status),j.robot_id,j.commands.map(c=>window.jobUI?window.jobUI.describe(c):c.target).join(' → '),`${j.done_commands}/${j.total_commands}`,j.error||j.traffic_waiting||'—',actions]);
   }
   empty(tb,7,app.site?'작업이 없습니다. 목적지를 등록한 뒤 작업을 만드세요.':'먼저 현장을 선택하세요.');
