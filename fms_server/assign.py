@@ -17,6 +17,13 @@ def _goal(job) -> Optional[dict]:
     return job.resolved_steps[0] if job.resolved_steps else None
 
 
+_ACTIONS = {"wait": "WAIT", "docking": "DOCK", "parking": "PARK", "pickup": "PICK", "drop": "DROP"}
+
+
+def _needed_actions(job) -> set:
+    return {_ACTIONS[c.kind] for c in job.commands if getattr(c, "kind", None) in _ACTIONS}
+
+
 def eligible(job, record, assignment, policy=None) -> Optional[str]:
     """이 로봇이 후보가 될 수 없는 이유 (될 수 있으면 None)."""
     if assignment is None or assignment.site_id != job.site_id:
@@ -25,6 +32,8 @@ def eligible(job, record, assignment, policy=None) -> Optional[str]:
         return "점검 중인 로봇"
     if job.robot_group and job.robot_group not in assignment.groups:
         return f"그룹 {job.robot_group} 로봇이 아니다"
+    if not record.supports(_needed_actions(job)):
+        return "이 작업의 액션을 지원하지 않는 로봇 (factsheet)"
     if (policy is not None and policy.get("enabled") and job.system != "charge" and record.state is not None
             and record.state.battery.charge < policy.get("min_job_charge", 0)):
         return f"배터리 {record.state.battery.charge:.0f}% — 작업 수락 기준 {policy['min_job_charge']}% 미만"

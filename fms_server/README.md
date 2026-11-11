@@ -1,6 +1,6 @@
 # FMS 서버와 웹 UI
 
-[프로젝트 시작 안내](../README.md) · [승강기와 층간 이동](../docs/elevators.md) · [교통 제어](../docs/traffic.md) · [개발 구조](../docs/architecture.md)
+[프로젝트 시작 안내](../README.md) · [운영 제어와 관측](../docs/operations.md) · [충전과 대기 위치](../docs/charging.md) · [승강기와 층간 이동](../docs/elevators.md) · [교통 제어](../docs/traffic.md) · [개발 구조](../docs/architecture.md)
 
 로봇의 MQTT 상태를 수집하고 현장·맵·목적지·작업·승강기를 관리하는 FastAPI 서버다.
 웹 UI는 서버의 `/`, API 문서는 `/docs`에서 제공한다. 프런트엔드 빌드나 외부 CDN은 필요 없다.
@@ -29,6 +29,10 @@
 | `FMS_DATA_ROOT` | `fms_server/maps` | 현장·맵·작업 영속 데이터 경로 |
 | `FMS_PUBLIC_URL` | `http://localhost:8000` | 로봇에 알리는 맵 다운로드 URL의 기준 |
 | `FMS_ELEVATOR_SIM` | `1` | 내장 가상 승강기 사용 여부 |
+| `FMS_EVENT_RETENTION_DAYS` | `30` | 이벤트 로그(`events.db`) 보존 일수. 0 이하면 지우지 않는다 |
+| `FMS_AUTH` | `0` | API 키 인증 사용 여부 ([운영 제어](../docs/operations.md#인증)) |
+| `FMS_ADMIN_KEY` | (없음) | 인증을 켰는데 키가 없을 때 등록할 admin 키. 없으면 무작위 키를 로그에 찍는다 |
+| `FMS_ROBOT_TOKEN` | (없음) | 로봇이 맵 번들을 받을 때 쓰는 토큰. 없으면 번들은 인증 없이 열린다 |
 
 기본 설정에서는 MQTT에 붙지 못해도 서버는 실행되며 재연결을 시도한다.
 `FMS_MQTT_REQUIRED=1`은 시작 호출의 오류를 전파하는 옵션이며, 비동기 브로커 연결 완료를 보장하지 않는다.
@@ -44,6 +48,16 @@ MQTT 연결 상태는 `/health`와 UI에서 확인한다. 다른 PC의 로봇을
 5. **실시간 맵**에서 목적지·구역·충전 스테이션을 추가한다.
 6. **작업 프리셋**을 만들고 **작업 게시판**에서 게시하거나 로봇을 지정한다.
 7. 여러 층을 쓸 때는 **엘리베이터**에서 층별 구역을 연결한다.
+
+운영 중에 쓰는 화면:
+
+| 화면 | 하는 일 | 설명 |
+|---|---|---|
+| **운영 제어** | 현장 정지·대피, 자동 충전 정책, 충전소·주차 지점 그룹 | [운영 제어](../docs/operations.md), [충전과 대기 위치](../docs/charging.md) |
+| **알림** | 열린 알림 확인(ack) | [운영 제어](../docs/operations.md#알림) |
+| **통계** | 작업·로봇 가동률·주행 거리·대기 시간 | [운영 제어](../docs/operations.md#통계) |
+| **이력** | 조작과 상태 변화 조회 | [운영 제어](../docs/operations.md#이력) |
+| **현장 설정** | 교통 정원·교착 상태, webhook, API 키 | [교통 제어](../docs/traffic.md) |
 
 ### 실시간 맵
 
@@ -190,10 +204,11 @@ X/Y는 회전 전 좌상단 좌표다. 양의 각도는 지도에서 시계 방�
 ### 배정 정책과 상태
 
 - 프리셋 publish에 robot_id가 없으면 자동 배정 게시판에 pending으로 등록한다. 있으면 해당 로봇에 즉시 배정을 시도한다.
-- FMS는 1초 주기로 게시 순서를 확인하고 로봇 ID 순으로 가용 후보를 검사한다.
-- MQTT 연결, 같은 현장, 현재 배정 맵의 UID/활성 버전, 최신 ONLINE 상태, AUTO·위치 확인·정지 해제·작업 없음, 배터리>0 조건을 확인한다.
+- FMS는 1초 주기로 우선순위가 높은 작업부터(같으면 게시 순) 확인하고, 비용이 낮은 로봇부터 가용 후보를 검사한다. 순서·비용·그룹·시작 시각·마감은 [충전과 대기 위치](../docs/charging.md) 참고.
+- MQTT 연결, 같은 현장, 현재 배정 맵의 UID/활성 버전, 최신 ONLINE 상태, AUTO·위치 확인·정지 해제·작업 없음, 배터리>0, 점검 중 아님, 현장 정지·대피 중 아님 조건을 확인한다.
 - 목적지가 다른 층이면 [승강기 경로](../docs/elevators.md)를 계획한다. 로봇이 목적지와 같은 층이어야만 하는 것은 아니다.
-- 후보가 없으면 pending과 대기 이유를 유지한다. 기존 `/jobs`로 만든 수동 pending은 자동 배정하지 않는다.
+- 후보가 없으면 pending과 대기 이유를 유지한다. `/jobs`로 만든 작업은 `auto_assign: true` 를 줄 때만 자동 배정한다.
+- 자동 충전·대기 위치 복귀·칸 내 복구는 FMS 가 만드는 시스템 작업(`system`)이다. 게시판에서는 접혀 있다.
 
 ```text
 pending → assigned → working → success / failed
@@ -227,12 +242,25 @@ assigned는 로봇 수신 확인 전에도 예약을 유지한다. assigned/work
 | `/robots/{id}/cargo` | GET | 로봇 두 트레이의 현재 물품 |
 | `/sites/{site}/presets` / `.../presets/{id}` | GET·POST / PUT·DELETE | 작업 프리셋 |
 | `.../presets/{id}/publish` | POST | `{}` 자동 배정 / `{"robot_id":"AMR-001"}` 직접 배정 |
-| `/sites/{site}/jobs` / `.../jobs/{id}` | GET·POST / GET·DELETE | 작업 생성·조회 |
-| `.../jobs/{id}/dispatch`, `/cancel` | POST | 수동 배정·취소 |
+| `/sites/{site}/jobs` / `.../jobs/{id}` | GET·POST / GET·PATCH·DELETE | 작업 생성·조회, pending 우선순위 변경. 생성에 `external_id`(멱등)·`auto_assign` |
+| `.../jobs/{id}/dispatch`, `/cancel`, `/retry` | POST | 수동 배정·취소·종료된 작업 재시도 |
 | `/sites/{site}/elevators` / `.../elevators/{id}` | GET·POST / GET·PUT·DELETE | 승강기 연결·운행 상태 |
 | `.../elevators/unlinked` | GET | 연결되지 않은 구역 |
+| `.../elevators/{id}/recover`, `/fault` | POST | 칸 내 복구 / 장애 주입(내장 시뮬레이터) — [승강기](../docs/elevators.md) |
 | `/robots`, `/robots/{id}`, `/robots/stream` | GET, GET, WebSocket | 플릿 상태와 변경 스트림 |
 | `/robots/{id}/init-position` | POST | 위치 힌트 |
+| `/robots/{id}/pause`, `/resume`, `/reset-error` | POST | 로봇 즉시 명령 |
+| `/sites/{site}/ops`, `/pause`, `/resume`, `/evacuation` | GET, POST | 현장 정지·대피 |
+| `/sites/{site}/charging`, `/charging/spots` | GET·PUT, GET | 자동 충전 정책 / 충전소·주차 지점 점유 |
+| `/sites/{site}/schedules` / `.../schedules/{id}` | GET·POST / PUT·DELETE | 프리셋 예약 실행 |
+| `.../maps/{map}/traffic` | GET·PUT | 정원·교착·정체·경로 교차 — [교통 제어](../docs/traffic.md) |
+| `/events`, `/events/stream` | GET, WebSocket | 이력 조회 / 실시간 이벤트 |
+| `/sites/{site}/kpi` | GET | 통계 |
+| `/alerts`, `/alerts/{id}/ack` | GET, POST | 알림 |
+| `/webhooks` / `/webhooks/{id}` | GET·POST / PUT·DELETE | 외부 통지 (admin) |
+| `/auth/me`, `/auth/keys`, `/auth/keys/{name}` | GET, GET·POST, DELETE | API 키 (admin) |
+
+운영 제어·이력·알림·통계·webhook·인증의 절차와 규칙은 [운영 제어와 관측](../docs/operations.md), 충전·대기 위치·예약은 [충전과 대기 위치](../docs/charging.md)에 있다.
 
 등록·업로드 예시는 **리포 루트**에서 실행한다. 브로커·FMS는 별도 터미널에서 먼저 켠다.
 
@@ -255,12 +283,18 @@ curl -X POST http://localhost:8000/api/v1/sites/demo/robots \
 locker_config.json          # 보관소 연동 설정
 locker_deliveries.json      # 배송 진행·로봇 예약
 cargo.json                  # 물품 ID·배송 묶음·트레이 (FMS 물품 장부)
+events.db                   # 이벤트 로그·알림·webhook 대기열 (sqlite3, WAL)
+elevator_leases.json        # 승강기 임대와 "확인 필요" 표시
+webhooks.json               # webhook 등록
+auth.json                   # API 키 해시 (FMS_AUTH=1 일 때)
 sites/{site_id}/
-  site.json
+  site.json                 # 로봇 배정(점검·그룹 포함), 현장 정지·대피 상태(ops)
   locations.json
   presets.json
   jobs.json
   elevators.json
+  charging.json             # 자동 충전 정책 (저장한 현장만)
+  schedules.json            # 예약 실행
   maps/{map_id}/
     active
     {version}/
@@ -279,8 +313,12 @@ sites/{site_id}/
 | `main.py`, `config.py` | 수명 주기와 설정 |
 | `sites.py`, `locations.py`, `presets.py` | 현장·목적지·템플릿 저장 |
 | `fleet.py`, `mqtt_client.py`, `coordinator.py` | 상태 수집과 맵 동기화 |
-| `task.py`, `allocator.py`, `route.py` | 작업 상태·자동 배정·층간 계획 |
-| `elevators.py`, `elevator_ctl.py`, `elevator_sim.py` | 승강기 연결·제어·시뮬레이션 |
+| `task.py`, `allocator.py`, `route.py`, `assign.py` | 작업 상태·자동 배정·층간 계획·로봇 비용 순위 |
+| `traffic.py` | 정원·점유 존 예약, 교착·정체 감지, 경로 교차 예고 |
+| `battery.py`, `charger_pool.py`, `scheduler.py` | 자동 충전·대기 복귀, 충전소·주차 지점 선택, 예약 실행 |
+| `elevators.py`, `elevator_ctl.py`, `elevator_sim.py` | 승강기 연결·제어(임대 영속화·대기열)·시뮬레이션 |
+| `events.py`, `robot_events.py`, `kpi.py`, `alerts.py`, `webhooks.py` | 이벤트 로그와 그 위의 통계·알림·외부 통지 |
+| `auth.py` | API 키와 역할 |
 | `mapkit/` | 입력 검증·주석·맵 굽기·버전 저장 |
 | `api/`, `static/` | REST/WebSocket과 웹 UI |
 
@@ -291,7 +329,7 @@ sites/{site_id}/
 ```
 
 맵별 동시 이동 대수 제한과 점유 존의 한 대씩 통과는 [교통 제어](../docs/traffic.md)를 따른다.
-전체 경로의 중앙 예약·자동 교착 해소와 충전 스케줄링은 아직 제공하지 않는다.
+전체 경로의 중앙 예약은 제공하지 않으며, 교착은 감지·알림하되 자동 해소 범위가 좁다.
 전체 제약과 해결 기록은 [알려진 문제](../docs/known-issues.md)에 모아 둔다.
 
 ## LastGate 보관소 배송

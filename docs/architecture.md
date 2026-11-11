@@ -1,6 +1,6 @@
 # 개발 구조와 구현 규칙
 
-[프로젝트 시작 안내](../README.md) · [에이전트 작업 규칙](../CLAUDE.md) · [로드맵](roadmap.md)
+[프로젝트 시작 안내](../README.md) · [에이전트 작업 규칙](../CLAUDE.md) · [운영 제어와 관측](operations.md) · [충전과 대기 위치](charging.md) · [로드맵](roadmap.md)
 
 구현의 세부 규칙을 모은 문서다. 설치·실행은 README, 서버 사용/API는 FMS README에서 관리한다.
 기존 설계의 검증 수치와 성능 값은 개발 당시의 관측 참고값이며 환경에 따라 달라진다.
@@ -32,6 +32,30 @@ FMS는 이 리포의 common을 직접 사용한다. 로봇·뷰어는 별도 AMR
   pickup zone은 `prohibit_zones()`에 들지 않아 굽지 않는다.
 - HTML/CSS/JS는 `fms_server/static/`에서 제공하며 npm 빌드나 CDN은 필요 없다. `fms.js`는 현장·맵 선택과 Canvas, `zone-editor.js`/`map-points.js`는 배치 편집, `jobs.js`는 프리셋과 게시판을 맡는다.
 - `robot-details.js`는 DOM을 유지하며 팝업 데이터를 갱신한다. `elevator-status.js`는 운행 상태 표만 갱신해 연결 편집 폼을 보존한다. 서버 미연결, 상태 미수신, 오래된 마지막 수신값을 구분한다.
+
+## 이벤트 로그와 그 위의 기능
+
+- `events.py` 의 `EventLog` 가 `events.db`(sqlite3, WAL)에 이력을 쌓는다. `record()` 는 큐에 넣기만 하므로 paho 스레드·코디네이터 락 안에서 불러도 된다. `event-log` 워커가 묶어서 commit 하고 그 뒤에 구독자를 부른다.
+- 현재 상태의 원본은 여전히 JSON 파일이다. `events.db` 에는 쌓이는 것만 둔다 (이벤트, 알림, webhook 대기열 — 같은 연결과 `db_lock` 을 공유한다).
+- `robot_events.py` 는 `Fleet` 리스너로 State 의 **변화만** 남기고, 상태별 체류 시간과 주행 거리를 1분마다 `robot.usage` 로 저장한다.
+- `kpi.py` 는 이벤트를 읽어 집계만 한다 (상태 저장 없음). `alerts.py` 는 배정 루프에서 상태 규칙을 평가하고 이벤트 구독으로 사건 규칙을 받는다. `webhooks.py` 는 이벤트 구독에서 대기열에 넣고 `webhooks` 워커가 보낸다.
+- `api/observe.py` 의 `EventStream` 은 워커 스레드의 이벤트를 `call_soon_threadsafe` 로 asyncio 루프에 넘겨 WebSocket 으로 흘린다.
+- `auth.py` 의 `authorize` 는 모든 API 라우터의 의존성이다. `FMS_AUTH=0` 이면 바로 통과한다. 역할은 메서드로 정한다 (GET viewer, 그 밖 operator, 키·webhook·현장 삭제 admin).
+
+## 운영 제어와 자동화
+
+- 새 주기 로직은 스레드를 만들지 않고 `allocator.py` 1초 루프의 tick 목록에 얹는다: 로봇 이벤트, 교통 안전(`task.tick_safety`), 배터리·대기 복귀(`battery.py`), 예약 실행(`scheduler.py`), 알림.
+- 현장 정지·대피 상태는 `site.json` 의 `ops` 에 있다 (`sites.py` `paused_for`/`evacuating`/`allocation_blocked`). `coordinator.py` 가 나중에 접속한 로봇에도 `PAUSE` 를 보낸다. 정지·대피는 교통 예약·승강기 임대를 풀지 않는다.
+- 배정은 `assign.py` 의 `rank_candidates` 로 후보 순서를 정하고 `dispatch` 가 가용성을 다시 검사한다. 순서만 바뀌었고 예약 규칙은 그대로다.
+- 자동 충전·대기 복귀·칸 내 복구는 `JobStore.create_system` 으로 만드는 시스템 작업이다 (`Job.system`). 일반 작업과 같은 dispatch·교통·승강기 경로를 탄다. KPI·게시판·재시도에서는 구분한다.
+- 충전소·주차 지점 선택은 `charger_pool.py` 한 곳에 있다. `battery.py` 와 `locker.py` 가 같이 쓴다.
+- 승강기 임대는 `elevator_leases.json` 에 저장한다. `task._reconcile_elevator_leases` 가 시작할 때 주인 없는 임대를 놓되 "확인 필요"(칸 안 로봇) 표시는 남긴다.
+
+## 로봇 사양과 적재 보고
+
+- `fms/v1/{id}/factsheet` (retained): 모델·크기·최대 속도·트레이 수·지원 액션·프로토콜 버전·`traffic_control`. `fleet.py` 가 보관하고 `supports()`·`traffic_control()` 로 답한다. 보고하지 않는 클라이언트는 전부 지원하는 것으로 보고 `State.traffic_control` 로 판정한다.
+- `State.loads`: `[{tray, payload_id}]`, 선택 필드. `alerts.py` 가 `cargo.json` 장부와 대조한다.
+- 감속 구역: `Zone.speed_limit`. 굽지 않고 `annotations.json` 으로만 전달한다. C++ `MapModel::speed_limit_at` 을 executor 가 속도 상한에 쓴다.
 
 ## 교통 제어
 

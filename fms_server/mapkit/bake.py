@@ -58,6 +58,8 @@ class BakeResult:
 # 형태학 (numpy only — scipy 없음)
 # =============================================================================
 
+DEFAULT_SLOW_SPEED = 0.5   # 감속 구역 기본 최고 속도 (m/s)
+
 def _erode(mask: np.ndarray) -> np.ndarray:
     """4-이웃 침식. mask: bool, True = 대상 픽셀."""
     out = mask.copy()
@@ -191,11 +193,16 @@ def build_annotations(
             except ValueError:
                 ztype = ZoneType.PROHIBIT
                 warnings.append(f"zone {entry.get('name')}: 미지 type '{entry.get('type')}' -> prohibit")
+            speed_limit = entry.get("speed_limit")
+            if ztype == ZoneType.SLOW and speed_limit is None:
+                speed_limit = DEFAULT_SLOW_SPEED   # 속도가 없는 벤더 감속 구역
+                warnings.append(f"zone {entry.get('name')}: 감속 구역에 speed_limit 이 없어 {DEFAULT_SLOW_SPEED} m/s 로 둔다")
             zones.append(
                 Zone(
                     zone_id=str(entry.get("id") or entry.get("name")),
                     name=str(entry.get("name", "")),
                     type=ztype,
+                    speed_limit=speed_limit if ztype == ZoneType.SLOW else None,
                     gates=entry.get("gates", []),
                     polygon=[Point(x=float(p[0]), y=float(p[1])) for p in poly],
                 )

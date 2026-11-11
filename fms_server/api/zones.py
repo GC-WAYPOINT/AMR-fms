@@ -18,7 +18,8 @@ class RectangleZoneRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False, str_strip_whitespace=True)
     base_version: str = Field(min_length=1)
     name: str = Field(min_length=1, max_length=128)
-    type: Literal['prohibit', 'elevator', 'occupancy']
+    type: Literal['prohibit', 'elevator', 'occupancy', 'slow']
+    speed_limit: float | None = Field(default=None, gt=0, le=10)   # 감속 구역(slow)의 최고 속도 m/s
     gates: list[TrafficGate] = Field(default_factory=list, max_length=16)
     x: float
     y: float
@@ -32,7 +33,7 @@ class RectangleZoneRequest(BaseModel):
         return self
 
     def zone(self, zone_id: str) -> Zone:
-        return Zone(zone_id=zone_id, name=self.name, type=self.type, gates=self.gates,
+        return Zone(zone_id=zone_id, name=self.name, type=self.type, gates=self.gates, speed_limit=self.speed_limit,
                     polygon=rectangle_polygon(self.x,self.y,self.width,self.height,self.rotation))
 
 

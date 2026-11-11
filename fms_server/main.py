@@ -109,7 +109,8 @@ async def lifespan(app: FastAPI):
     app.state.cargo = cargo
     locker = LockerBridge(registry, fleet, jobs, job_coordinator, mqtt, settings.data_root, cargo=cargo, events=events)
     app.state.locker = locker
-    alerts = AlertManager(events, job_coordinator, battery=battery, locker=locker, elevators=elevator_store)
+    alerts = AlertManager(events, job_coordinator, battery=battery, locker=locker, elevators=elevator_store,
+                          cargo=cargo)
     webhooks = WebhookManager(events, settings.data_root)
     event_stream = EventStream(events)
     allocator.ticks.append(("alerts", alerts.tick))

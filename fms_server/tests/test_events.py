@@ -162,8 +162,10 @@ def test_robot_changes_only(tmp_path, log):
 def test_events_api(tmp_path):
     from fms_server.main import app
     with TestClient(app) as c:
-        app.state.events.record("job.success", site_id="hq", job_id="hq-J0001")
-        app.state.events.record("robot.error", site_id="hq", robot_id="AMR-001", severity="error")
-        body = c.get("/api/v1/events", params={"site": "hq", "kind": "job."}).json()
+        # events.db 는 테스트 세션이 같이 쓴다. 다른 테스트와 겹치지 않는 현장 ID 로 센다.
+        site = "events-api-only"
+        app.state.events.record("job.success", site_id=site, job_id="hq-J0001")
+        app.state.events.record("robot.error", site_id=site, robot_id="AMR-001", severity="error")
+        body = c.get("/api/v1/events", params={"site": site, "kind": "job."}).json()
         assert body["count"] == 1 and body["events"][0]["job_id"] == "hq-J0001"
         assert c.get("/api/v1/events", params={"limit": 0}).status_code == 422

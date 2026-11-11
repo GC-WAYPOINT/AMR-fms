@@ -774,7 +774,7 @@ function showObject(hit) {
   else {
     const station=d.type==='pickup'?app.pickupStations.find(s=>s.station_id===d.zone_id):null;
     box.append(el('h3',station?.name||d.name||'이름 없는 구역'),el('p',({
-      prohibit:'주행금지구역 (Forbidden zone)',elevator:'엘리베이터 구역 · 위치 표시용',slow:'감속 구역 · 표시 전용',oneway:'일방통행 구역 · 표시 전용',
+      prohibit:'주행금지구역 (Forbidden zone)',elevator:'엘리베이터 구역 · 위치 표시용',slow:'감속 구역 · 구역 안 속도 제한',oneway:'일방통행 구역 · 표시 전용',
       occupancy:'점유 존 · 한 대씩 통과',
       pickup:'픽업스테이션 구역 · 적재 장치 위치 표시용 (주행을 막지 않음)'
     })[d.type]||d.type));

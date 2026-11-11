@@ -14,7 +14,7 @@ from typing import Optional
 
 from pydantic import BaseModel
 
-from common.schemas import State
+from common.schemas import Factsheet, State
 from fms_server.fleet import Fleet, RobotLiveness, RobotRecord
 from fms_server.robot_events import status_of
 from fms_server.sites import RobotAssignment, SiteRegistry
@@ -44,6 +44,7 @@ class RobotView(BaseModel):
     last_connection_at: Optional[float] = None
 
     state: Optional[State] = None
+    factsheet: Optional[Factsheet] = None   # 로봇 사양 (보고하는 클라이언트만)
 
     @classmethod
     def from_record(
@@ -93,6 +94,7 @@ class RobotView(BaseModel):
             last_state_at=record.last_state_at,
             last_connection_at=record.last_connection_at,
             state=record.state,
+            factsheet=record.factsheet,
         )
 
 

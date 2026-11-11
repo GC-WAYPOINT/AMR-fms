@@ -74,10 +74,13 @@ window.zoneEditor = (() => {
   const occupancy = () => ['occupancy', 'oneway'].includes(field('type').value);
   function sync() {
     $('#addTrafficGate').hidden = oneway();
+    $('#zoneSpeedLabel').hidden = pickup || field('type').value !== 'slow';
+    field('speedLimit').disabled = busy;
     $('#trafficGateFields').hidden = pickup || field('type').value !== 'occupancy';
     if (!pickup) $('#zoneDescription').textContent = occupancy()
       ? (oneway() ? '대기 node 에서 출구 node 방향으로만, 한 대씩 통과합니다. 반대 방향 진입로는 만들지 않습니다. 저장하면 새 맵 버전을 로봇에 전달합니다.'
         : '한 대씩 통과합니다. 대기·출구는 차체 여유를 두고 배치하세요. 저장하면 새 맵 버전을 로봇에 전달합니다.')
+      : field('type').value === 'slow' ? '구역 안에서 로봇이 이 속도 이하로 달립니다. 주행을 막지는 않습니다. 감속을 지원하는 로봇 클라이언트가 필요합니다.'
       : '저장하면 새 맵 버전을 활성화하고 로봇에 전달합니다. 엘리베이터 구역은 위치 표시용입니다.';
     $('#addTrafficGate').disabled = busy;
     $('#trafficGateRows').querySelectorAll('input,select,button').forEach(control => { control.disabled = busy; });
@@ -136,6 +139,7 @@ window.zoneEditor = (() => {
     gates = structuredClone(zone?.gates || []);
     renderGates();
     field('name').value = station?.name || zone?.name || '';
+    if (zone?.speed_limit) field('speedLimit').value = zone.speed_limit;
     field('type').value = pickup ? 'prohibit' : zone?.type === 'occupancy' && gates.length === 1 ? 'oneway' : (zone?.type || 'prohibit');
     $('#zoneTypeLabel').hidden = pickup;
     $('#pickupNodeFields').hidden = !pickup;
@@ -311,7 +315,7 @@ window.zoneEditor = (() => {
       if (station) box.append(button('픽업스테이션 삭제', () => deleteStation(station), 'danger'));
       return;
     }
-    if (['prohibit','elevator','occupancy'].includes(zone.type) && rectangle(zone.polygon))
+    if (['prohibit','elevator','occupancy','slow'].includes(zone.type) && rectangle(zone.polygon))
       box.append(button('구역 편집',()=>start(zone)));
     box.append(button('구역 삭제',async()=>{
       if (!confirm(`'${zone.name||zone.zone_id}' 구역을 삭제하고 새 맵 버전을 적용할까요?`)) return;
@@ -395,6 +399,10 @@ window.zoneEditor = (() => {
       } else {
         data={base_version:baseVersion,name,type:occupancy()?'occupancy':field('type').value,...dimensions};
         if (oneway() && gates.length !== 1) throw new Error('일방통행 통로는 진입 방향이 하나여야 합니다.');
+        if (data.type === 'slow') {
+            data.speed_limit = Number(field('speedLimit').value);
+            if (!(data.speed_limit > 0)) throw new Error('감속 구역의 최고 속도를 입력하세요.');
+        }
         if (data.type === 'occupancy') {
           if (!gates.length || gates.some(g => !g.wait || !g.exit)) throw new Error('방향별 대기 node와 출구 node를 선택하세요.');
           data.gates = gates;

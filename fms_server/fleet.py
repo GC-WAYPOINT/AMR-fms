@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional
 
-from common.schemas import ConnectionState, State
+from common.schemas import ConnectionState, Factsheet, State
 
 
 class RobotLiveness(str, Enum):
@@ -51,6 +51,7 @@ class RobotRecord:
     robot_id: str
     state: Optional[State] = None
     connection: Optional[ConnectionState] = None
+    factsheet: Optional[Factsheet] = None    # 로봇 사양 (보고하는 클라이언트만)
 
     first_seen: float = field(default_factory=time.time)
     last_state_at: Optional[float] = None
@@ -73,6 +74,19 @@ class RobotRecord:
             return RobotLiveness.ONLINE if fresh else RobotLiveness.STALE
         # connection 소식이 아예 없는데 state 는 들어오는 경우 (retain 유실 등).
         return RobotLiveness.ONLINE if fresh else RobotLiveness.UNKNOWN
+
+    @property
+    def traffic_control(self) -> bool:
+        """점유 존 제어 지원. Factsheet 가 있으면 그 값, 없으면(구형) State 값."""
+        if self.factsheet is not None:
+            return self.factsheet.traffic_control
+        return bool(self.state and self.state.traffic_control)
+
+    def supports(self, action_types) -> bool:
+        """이 액션들을 수행할 수 있나. Factsheet 가 없으면 알 수 없으므로 된다고 본다."""
+        if self.factsheet is None or not self.factsheet.actions:
+            return True
+        return set(action_types) <= set(self.factsheet.actions)
 
     def available_for_job(self, stale_after: float, now: Optional[float] = None) -> bool:
         """새 작업을 받을 수 있나. 할당기(allocator)가 보는 술어.
@@ -124,6 +138,13 @@ class Fleet:
             record.last_connection_at = now
             snapshot = _copy_record(record)
         self._emit(FleetEvent(kind="connection", robot_id=robot_id, record=snapshot))
+
+    def apply_factsheet(self, factsheet: Factsheet) -> None:
+        with self._lock:
+            record = self._robots.setdefault(factsheet.robot_id, RobotRecord(robot_id=factsheet.robot_id))
+            record.factsheet = factsheet
+            snapshot = _copy_record(record)
+        self._emit(FleetEvent(kind="factsheet", robot_id=factsheet.robot_id, record=snapshot))
 
     def forget(self, robot_id: str) -> bool:
         """레지스트리에서 로봇을 지운다 (테스트/운영 정리용)."""
@@ -186,6 +207,7 @@ def _copy_record(record: RobotRecord) -> RobotRecord:
         robot_id=record.robot_id,
         state=record.state,
         connection=record.connection,
+        factsheet=record.factsheet,
         first_seen=record.first_seen,
         last_state_at=record.last_state_at,
         last_connection_at=record.last_connection_at,

@@ -314,7 +314,9 @@ class TrafficController:
         if not zones and self.limit(job.site_id, map_id) is None:
             job.traffic = {}
             return order
-        if zones and not state.traffic_control:
+        record = self.fleet.get(job.robot_id)
+        supported = record.traffic_control if record is not None and record.factsheet is not None else state.traffic_control
+        if zones and not supported:
             raise TrafficError("이 로봇은 점유 존 제어를 지원하지 않습니다. 클라이언트를 갱신하세요")
         planner = None
         if zones:

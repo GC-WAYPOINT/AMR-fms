@@ -30,7 +30,9 @@ from pydantic import ValidationError
 
 from common.schemas import (
     TOPIC_CONNECTION_ALL,
+    TOPIC_FACTSHEET_ALL,
     TOPIC_STATE_ALL,
+    Factsheet,
     Connection,
     ConnectionState,
     InstantAction,
@@ -130,7 +132,7 @@ class FmsMqttClient:
             log.warning("MQTT 연결 거부: %s", reason_code)
             return
         self._connected = True
-        client.subscribe([(TOPIC_STATE_ALL, 0), (TOPIC_CONNECTION_ALL, 1)])
+        client.subscribe([(TOPIC_STATE_ALL, 0), (TOPIC_CONNECTION_ALL, 1), (TOPIC_FACTSHEET_ALL, 1)])
         for topic in self._json_handlers:
             client.subscribe(topic, qos=1)
         log.info("MQTT 연결됨, 구독: %s, %s", TOPIC_STATE_ALL, TOPIC_CONNECTION_ALL)
@@ -162,6 +164,20 @@ class FmsMqttClient:
             self._handle_state(robot_id, payload)
         elif kind == "connection":
             self._handle_connection(robot_id, payload)
+        elif kind == "factsheet":
+            self._handle_factsheet(robot_id, payload)
+
+    def _handle_factsheet(self, robot_id: str, payload: str) -> None:
+        if not payload.strip():
+            return
+        try:
+            factsheet = Factsheet.model_validate_json(payload)
+        except ValidationError as exc:
+            log.warning("%s factsheet 검증 실패: %s", robot_id, _short(exc))
+            return
+        if factsheet.robot_id != robot_id:
+            return
+        self._fleet.apply_factsheet(factsheet)
 
     def _handle_state(self, robot_id: str, payload: str) -> None:
         try:
@@ -219,7 +235,7 @@ def _parse_topic(topic: str) -> tuple[Optional[str], Optional[str]]:
     if len(parts) != 4 or parts[0] != "fms" or parts[1] != "v1":
         return None, None
     _, _, robot_id, kind = parts
-    if kind not in ("state", "connection"):
+    if kind not in ("state", "connection", "factsheet"):
         return None, None
     return robot_id, kind
 
