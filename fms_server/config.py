@@ -64,6 +64,11 @@ class Settings:
     # 이벤트 로그(events.db) 보존 기간 (일). 0 이하면 지우지 않는다.
     event_retention_days: float = 30.0
 
+    # 인증 (기본 꺼짐). 켜면 REST·WebSocket 에 API 키가 필요하다. fms_server/auth.py 참고.
+    auth: bool = False
+    admin_key: str = ""       # 키가 하나도 없을 때 등록할 admin 키 (없으면 무작위로 만들어 로그에 찍는다)
+    robot_token: str = ""     # 있으면 로봇의 맵 번들 GET 에 ?token= 이 필요하다 (SET_MAP URL 에 붙여 준다)
+
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
@@ -77,6 +82,9 @@ class Settings:
             mqtt_required=_env_str("FMS_MQTT_REQUIRED", "0") not in ("0", "", "false", "False"),
             elevator_sim=_env_str("FMS_ELEVATOR_SIM", "1") not in ("0", "false", "False", "no", "off"),
             event_retention_days=_env_float("FMS_EVENT_RETENTION_DAYS", cls.event_retention_days),
+            auth=_env_str("FMS_AUTH", "0") not in ("0", "", "false", "False", "no", "off"),
+            admin_key=_env_str("FMS_ADMIN_KEY", ""),
+            robot_token=_env_str("FMS_ROBOT_TOKEN", ""),
         )
 
 

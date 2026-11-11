@@ -6,7 +6,7 @@ const app = {
   page:'map', sites:[], site:null, detail:null, map:null, locations:[], pickupStations:[], cargo:null, robots:new Map(), jobs:[], steps:[], edit:null, selection:null, mapToken:0, siteToken:0
 };
 const titles = {
-  map:'실시간 맵', robots:'로봇', jobs:'작업 게시판', presets:'작업 프리셋', maps:'맵 관리', locations:'목적지·도킹', elevators:'엘리베이터', settings:'현장 설정', events:'이력', ops:'운영 제어'
+  map:'실시간 맵', robots:'로봇', jobs:'작업 게시판', presets:'작업 프리셋', maps:'맵 관리', locations:'목적지·도킹', elevators:'엘리베이터', settings:'현장 설정', events:'이력', ops:'운영 제어', alerts:'알림', stats:'통계'
 };
 const types = {
   station:'작업 지점', charger:'충전소', parking:'주차 지점', waypoint:'경유점', pickup:'픽업 지점', tray_return:'반납 지점', other:'기타'
@@ -47,18 +47,29 @@ async function run(fn) {
     notify(e.message,true);
   }
 }
+// 인증(FMS_AUTH=1)을 켠 서버에서는 API 키를 브라우저에 저장해 두고 모든 요청에 붙인다.
+window.fmsAuth={
+  get(){try{return localStorage.getItem('fmsApiKey')||'';}catch{return '';}},
+  set(key){try{key?localStorage.setItem('fmsApiKey',key):localStorage.removeItem('fmsApiKey');}catch{}},
+  asked:false
+};
 async function request(url, method='GET', body) {
   const options={
-    method
+    method,headers:{}
   };
+  if(window.fmsAuth.get())options.headers.Authorization=`Bearer ${window.fmsAuth.get()}`;
   if(body instanceof FormData)options.body=body;
   else if(body!==undefined){
-    options.headers={
-      'Content-Type':'application/json'
-    };
+    options.headers['Content-Type']='application/json';
     options.body=JSON.stringify(body);
   }
   const r=await fetch(url,options);
+  if(r.status===401&&!window.fmsAuth.asked){
+    // 한 번만 묻는다 (주기 갱신마다 창이 뜨지 않게).
+    window.fmsAuth.asked=true;
+    const key=prompt('이 서버는 API 키가 필요합니다. 키를 입력하세요.');
+    if(key){window.fmsAuth.set(key.trim());location.reload();}
+  }
   const text=await r.text();
   let data;
   try{
@@ -119,6 +130,7 @@ function showPage(page) {
   document.title=`FMS · ${titles[page]}`;
   if(location.hash!==`#${page}`)history.replaceState(null,'',`#${page}`);
   if(page==='map')resize();
+  window.observeUI?.pageShown(page);
 }
 for(const b of document.querySelectorAll('[data-page],[data-goto]'))b.onclick=()=>showPage(b.dataset.page||b.dataset.goto);
 window.addEventListener('hashchange',()=>showPage(location.hash.slice(1)));
@@ -481,7 +493,7 @@ async function loadMap() {
     const [meta,annotations]=await Promise.all([request(file('fms_map.json')),request(file('annotations.json'))]);
     const image=new Image();
     await new Promise((resolve,reject)=>{
-      image.onload=resolve;image.onerror=()=>reject(new Error('맵 이미지를 불러오지 못했습니다.'));image.src=file(meta.image);
+      image.onload=resolve;image.onerror=()=>reject(new Error('맵 이미지를 불러오지 못했습니다.'));image.src=file(meta.image)+(window.fmsAuth.get()?'&api_key='+enc(window.fmsAuth.get()):'');
     });
     if(token!==app.mapToken)return;
     if(!Number.isFinite(meta.resolution)||meta.resolution<=0||!Number.isFinite(meta.origin_x)||!Number.isFinite(meta.origin_y))throw new Error('맵 좌표 정보가 올바르지 않습니다.');
@@ -875,7 +887,7 @@ async function pollFleet() {
   }
 }
 function connectStream() {
-  const ws=new WebSocket(`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/api/v1/robots/stream`);
+  const ws=new WebSocket(`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/api/v1/robots/stream${window.fmsAuth.get()?'?api_key='+enc(window.fmsAuth.get()):''}`);
   ws.onmessage=e=>{
     try{
       const data=JSON.parse(e.data);

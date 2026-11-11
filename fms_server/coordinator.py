@@ -37,12 +37,14 @@ class SiteCoordinator:
         public_url: str,
         *,
         resend_cooldown: float = 10.0,
+        robot_token: str = "",
     ) -> None:
         self._fleet = fleet
         self._registry = registry
         self._mqtt = mqtt
         self._public_url = public_url.rstrip("/")
         self._resend_cooldown = resend_cooldown
+        self._robot_token = robot_token   # 인증을 켰을 때 로봇이 맵 번들을 받을 수 있게 URL 에 붙인다
 
         self._lock = threading.Lock()
         # robot_id -> (target_version, sent_at)
@@ -188,6 +190,8 @@ class SiteCoordinator:
             f"{self._public_url}/api/v1/sites/{assignment.site_id}"
             f"/maps/{assignment.map_id}/bundle?version={target_version}"
         )
+        if self._robot_token:
+            url += f"&token={self._robot_token}"
         send_instant(self._mqtt, robot_id, InstantActionType.SET_MAP, {
             "map_id": map_uid,          # 로봇은 이 값을 맵 이름으로 쓴다
             "map_version": target_version,

@@ -16,6 +16,7 @@
 <script src="/static/jobs.js" defer></script>
 <script src="/static/events.js" defer></script>
 <script src="/static/ops.js" defer></script>
+<script src="/static/observe.js" defer></script>
 </head>
 <body>
 <aside class="sidebar">
@@ -31,6 +32,8 @@
     <button data-page="locations"><span>⌖</span>목적지·도킹</button>
     <button data-page="elevators"><span>⇅</span>엘리베이터</button>
     <button data-page="ops"><span>⏻</span>운영 제어</button>
+    <button data-page="alerts"><span>⚑</span>알림<b id="alertBadge" class="nav-badge" hidden></b></button>
+    <button data-page="stats"><span>▥</span>통계</button>
     <button data-page="events"><span>☰</span>이력</button>
     <button data-page="settings"><span>⚙</span>현장 설정</button>
   </nav>
@@ -232,6 +235,20 @@
     </form><p class="muted">충전소는 목적지 용도 '충전소'(맵 충전기와 일치), 대기 위치는 '주차 지점'입니다. 대기 위치로 가는 중인 로봇은 새 작업이 오면 되돌립니다.</p></div>
     <div class="table-wrap"><table><thead><tr><th>이름</th><th>종류</th><th>맵</th><th>상태</th><th>진입</th><th>사용 그룹</th></tr></thead><tbody id="spotRows"></tbody></table></div>
   </section>
+  <section id="page-alerts" class="page content-page" hidden>
+    <div class="page-heading"><div><h2>알림</h2><p>운영자가 확인해야 하는 상황입니다. 상태 알림은 조건이 사라지면 스스로 닫히고, 작업 실패·마감 초과는 확인하면 닫힙니다.</p></div></div>
+    <div class="panel"><label class="check"><input type="checkbox" id="alertHistory"> 해소된 알림도 표시</label></div>
+    <div class="table-wrap"><table><thead><tr><th>발생</th><th>내용</th><th>상태</th><th>확인</th><th></th></tr></thead><tbody id="alertRows"></tbody></table></div>
+  </section>
+  <section id="page-stats" class="page content-page" hidden>
+    <div class="page-heading"><div><h2>통계</h2><p>이벤트 로그를 집계한 운영 지표입니다. 자동 충전·대기 복귀 같은 시스템 작업과 배송 하위 작업은 작업 수에서 뺍니다.</p></div>
+      <label>기간<select id="kpiRange"><option value="24h">최근 24시간 (시간별)</option><option value="7d">최근 7일 (일별)</option><option value="30d">최근 30일 (일별)</option></select></label></div>
+    <div id="kpiTiles" class="kpi-tiles"></div>
+    <div class="panel"><h3>작업 처리</h3><canvas id="kpiJobs" class="kpi-chart"></canvas><div id="kpiJobsKey" class="chart-keys"></div></div>
+    <div class="panel"><h3>로봇 상태 시간</h3><canvas id="kpiStates" class="kpi-chart"></canvas><div id="kpiStatesKey" class="chart-keys"></div></div>
+    <div class="panel"><h3>대기 시간</h3><canvas id="kpiWaits" class="kpi-chart"></canvas><div id="kpiWaitsKey" class="chart-keys"></div></div>
+    <div class="table-wrap"><table><thead><tr><th>로봇</th><th>가동률</th><th>수행</th><th>대기</th><th>충전</th><th>오류</th><th>주행 거리</th><th>충전 횟수</th><th>완료 / 실패</th></tr></thead><tbody id="kpiRobots"></tbody></table></div>
+  </section>
   <section id="page-events" class="page content-page" hidden>
     <div class="page-heading"><div><h2>이력</h2><p>작업·로봇·교통·승강기·운영 조작의 이벤트 로그입니다. 보존 기간이 지나면 지워집니다.</p></div></div>
     <div class="panel"><form id="eventFilter">
@@ -255,6 +272,23 @@
     </div>
     <div class="panel"><h3>현장 등록</h3><form id="siteForm"><label>현장 ID<input name="site_id" placeholder="hq" required></label><label>현장 이름<input name="name" placeholder="본사" required></label><button class="primary">현장 등록</button></form></div>
     <div class="table-wrap"><table><thead><tr><th>현장</th><th>ID</th><th>맵</th><th>로봇</th><th></th></tr></thead><tbody id="siteRows"></tbody></table></div>
+    <div class="panel"><h3>인증</h3><p id="authState" class="muted">확인 중</p><button type="button" id="apiKeyChange">이 브라우저의 API 키 바꾸기</button></div>
+    <div id="integrationPanels" hidden>
+      <div class="panel"><h3>Webhook</h3><form id="webhookForm">
+        <label>이름<input name="name" maxlength="128" placeholder="WMS"></label>
+        <label>URL<input name="url" type="url" required placeholder="https://wms.example/hook"></label>
+        <label>이벤트 종류<input name="kinds" placeholder="job., alert. (빈칸이면 이 둘)"></label>
+        <label>서명 비밀값<input name="secret" type="password" autocomplete="off" placeholder="X-FMS-Signature 용"></label>
+        <button class="primary">webhook 등록</button>
+      </form><p class="muted">이벤트를 JSON 으로 POST 합니다. 실패하면 간격을 늘려 다시 보냅니다. <span id="webhookPending"></span></p></div>
+      <div class="table-wrap"><table><thead><tr><th>이름</th><th>URL</th><th>이벤트</th><th>서명</th><th>상태</th><th></th></tr></thead><tbody id="webhookRows"></tbody></table></div>
+      <div class="panel"><h3>API 키</h3><form id="apiKeyForm">
+        <label>이름<input name="name" maxlength="64" required placeholder="wms"></label>
+        <label>역할<select name="role"><option value="viewer">viewer · 조회</option><option value="operator">operator · 운영 조작</option><option value="admin">admin · 키·webhook·현장 삭제</option></select></label>
+        <button class="primary">키 발급</button>
+      </form><p class="muted">키 원문은 발급 직후에만 볼 수 있습니다. 외부 시스템은 Authorization: Bearer 헤더로 보냅니다.</p></div>
+      <div class="table-wrap"><table><thead><tr><th>이름</th><th>역할</th><th>발급</th><th></th></tr></thead><tbody id="apiKeyRows"></tbody></table></div>
+    </div>
     <div class="panel"><h3>서버 상태</h3><p id="healthDetail">확인 중</p><details><summary>최근 알림</summary><div id="log"></div></details></div>
   </section>
   <div id="notice" role="status" hidden><span></span><button aria-label="알림 닫기">×</button></div>

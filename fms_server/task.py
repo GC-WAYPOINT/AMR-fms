@@ -544,7 +544,16 @@ class JobCoordinator:
             data.setdefault("job_id", job.job_id)
             if job.preset_name:
                 data.setdefault("preset", job.preset_name)
+            if job.system:
+                data.setdefault("system", job.system)       # KPI 는 시스템 작업을 따로 센다
+            if job.external_owner:
+                data.setdefault("delivery", job.external_owner)
         self._events.record(kind, severity=severity, **data)
+
+    @staticmethod
+    def _since(iso: Optional[str]) -> Optional[float]:
+        start = _epoch(iso) if iso else None
+        return round(time.time() - start, 2) if start else None
 
     @property
     def traffic(self):
@@ -724,7 +733,7 @@ class JobCoordinator:
             job.error = f"오더 전송 확인 필요: {exc}"
             self._store.save(job)
         log.info("job 디스패치: %s -> %s (노드 %d개)", job_id, target_robot, len(order.nodes))
-        self._event("job.assigned", job, nodes=len(order.nodes))
+        self._event("job.assigned", job, nodes=len(order.nodes), waited=self._since(job.created_at))
         return job
 
     # -- 다층 job ----------------------------------------------------
@@ -761,7 +770,7 @@ class JobCoordinator:
         job.touch()
         self._store.save(job)
         log.info("다층 job 디스패치: %s -> %s (stage %d개)", job.job_id, robot_id, len(plan))
-        self._event("job.assigned", job, stages=len(plan))
+        self._event("job.assigned", job, stages=len(plan), waited=self._since(job.created_at))
         self._step_multi(job)
         return job
 
@@ -1480,4 +1489,5 @@ class JobCoordinator:
         log.info("job %s -> %s%s", job.job_id, status.value, f" ({error})" if error else "")
         self._event(f"job.{status.value}", job,
                     "error" if status == JobStatus.FAILED else "info", error=error,
+                    duration=self._since(job.dispatched_at),
                     done_commands=job.done_commands, total_commands=len(job.commands))

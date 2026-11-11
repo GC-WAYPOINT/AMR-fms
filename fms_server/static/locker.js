@@ -3,7 +3,10 @@ const parcelStates = {planned:'적재 예정',loading:'적재 중',onboard:'로�
 let locations = [], stations = [], lastDeliveries = '', lastParcels = '', returning = null;
 const openSteps = new Set();
 async function api(path, method='GET', body) {
-  const response = await fetch(`/api/v1/${path}`, {method, headers:{'Content-Type':'application/json'}, body:body === undefined ? undefined : JSON.stringify(body)});
+  const headers = {'Content-Type':'application/json'};
+  let key = ''; try { key = localStorage.getItem('fmsApiKey') || ''; } catch {}
+  if (key) headers.Authorization = `Bearer ${key}`;   // 인증을 켠 서버 (관제 화면에서 저장한 키)
+  const response = await fetch(`/api/v1/${path}`, {method, headers, body:body === undefined ? undefined : JSON.stringify(body)});
   const data = await response.json();
   if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
   return data;

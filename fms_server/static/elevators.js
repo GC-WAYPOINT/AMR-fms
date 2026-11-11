@@ -22,7 +22,7 @@
         return {id:z.zone_id, name:z.name, x0:Math.min(...xs), x1:Math.max(...xs), y0:Math.min(...ys), y1:Math.max(...ys)};
       });
       const image = new Image();
-      await new Promise((res, rej) => { image.onload = res; image.onerror = () => rej(new Error(`${m.map_id} 맵 이미지를 불러오지 못했습니다.`)); image.src = file(meta.image); });
+      await new Promise((res, rej) => { image.onload = res; image.onerror = () => rej(new Error(`${m.map_id} 맵 이미지를 불러오지 못했습니다.`)); image.src = file(meta.image) + (window.fmsAuth?.get() ? '&api_key=' + enc(window.fmsAuth.get()) : ''); });
       floors.push({map_id:m.map_id, meta, image, zones, canvas:null, hover:null});
     }
     if (site !== app.site) return;

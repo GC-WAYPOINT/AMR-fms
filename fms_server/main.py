@@ -18,7 +18,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -51,6 +51,11 @@ from fms_server.api.locker import router as locker_router
 from fms_server.api.events import router as events_router
 from fms_server.api.ops import router as ops_router
 from fms_server.api.charging import router as charging_router
+from fms_server.api.observe import EventStream, router as observe_router
+from fms_server.api.auth import router as auth_router
+from fms_server.alerts import AlertManager
+from fms_server.auth import AuthStore, authorize
+from fms_server.webhooks import WebhookManager
 from fms_server.battery import BatteryManager
 from fms_server.scheduler import ScheduleStore, Scheduler
 from fms_server.events import EventLog
@@ -69,7 +74,11 @@ async def lifespan(app: FastAPI):
     events = EventLog(settings.data_root, retention_days=settings.event_retention_days)
     fleet = Fleet(stale_after=settings.robot_stale_after)
     mqtt = FmsMqttClient(fleet, settings)
-    coordinator = SiteCoordinator(fleet, registry, mqtt, settings.public_url)
+    coordinator = SiteCoordinator(fleet, registry, mqtt, settings.public_url, robot_token=settings.robot_token)
+    auth = AuthStore(settings.data_root)
+    if settings.auth:
+        auth.bootstrap(settings.admin_key)
+    app.state.auth = auth
     broadcaster = FleetBroadcaster(fleet, registry)
     jobs = JobStore(settings.data_root)
     elevator_ctl = ElevatorController(settings, events=events,
@@ -100,6 +109,11 @@ async def lifespan(app: FastAPI):
     app.state.cargo = cargo
     locker = LockerBridge(registry, fleet, jobs, job_coordinator, mqtt, settings.data_root, cargo=cargo, events=events)
     app.state.locker = locker
+    alerts = AlertManager(events, job_coordinator, battery=battery, locker=locker, elevators=elevator_store)
+    webhooks = WebhookManager(events, settings.data_root)
+    event_stream = EventStream(events)
+    allocator.ticks.append(("alerts", alerts.tick))
+    app.state.alerts, app.state.webhooks, app.state.event_stream = alerts, webhooks, event_stream
     app.state.presets = presets
     app.state.allocator = allocator
 
@@ -118,6 +132,8 @@ async def lifespan(app: FastAPI):
 
     events.start()
     events.record("server.start")
+    event_stream.start()
+    webhooks.start()
     robot_events.start()
     broadcaster.start()
     coordinator.start()
@@ -141,6 +157,8 @@ async def lifespan(app: FastAPI):
         job_coordinator.stop()
         coordinator.stop()
         await broadcaster.stop()
+        await event_stream.stop()
+        webhooks.stop()
         robot_events.stop()
         events.record("server.stop")
         events.stop()
@@ -148,21 +166,25 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="FMS Server", version="0.1.0", lifespan=lifespan)
-app.include_router(robots_router)
-app.include_router(sites_router)
-app.include_router(locations_router)
-app.include_router(jobs_router)
-app.include_router(presets_router)
-app.include_router(zones_router)
-app.include_router(traffic_router)
-app.include_router(map_points_router)
-app.include_router(pickup_stations_router)
-app.include_router(cargo_router)
-app.include_router(elevators_router)
-app.include_router(locker_router)
-app.include_router(events_router)
-app.include_router(ops_router)
-app.include_router(charging_router)
+# 인증은 라우터마다 건다 (FMS_AUTH=0 이면 authorize 가 바로 통과시킨다). REST·WebSocket 공통.
+_AUTH = [Depends(authorize)]
+app.include_router(robots_router, dependencies=_AUTH)
+app.include_router(sites_router, dependencies=_AUTH)
+app.include_router(locations_router, dependencies=_AUTH)
+app.include_router(jobs_router, dependencies=_AUTH)
+app.include_router(presets_router, dependencies=_AUTH)
+app.include_router(zones_router, dependencies=_AUTH)
+app.include_router(traffic_router, dependencies=_AUTH)
+app.include_router(map_points_router, dependencies=_AUTH)
+app.include_router(pickup_stations_router, dependencies=_AUTH)
+app.include_router(cargo_router, dependencies=_AUTH)
+app.include_router(elevators_router, dependencies=_AUTH)
+app.include_router(locker_router, dependencies=_AUTH)
+app.include_router(events_router, dependencies=_AUTH)
+app.include_router(ops_router, dependencies=_AUTH)
+app.include_router(observe_router, dependencies=_AUTH)
+app.include_router(auth_router, dependencies=_AUTH)
+app.include_router(charging_router, dependencies=_AUTH)
 
 _ADMIN_HTML = Path(__file__).parent / "static" / "admin.html"
 app.mount("/static", StaticFiles(directory=_ADMIN_HTML.parent), name="static")
