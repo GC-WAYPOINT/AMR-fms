@@ -44,6 +44,8 @@ JOBS_FILE = "jobs.json"
 # 다층 작업 stage 오더를 보낸 뒤 로봇 State 에 order_id 가 보일 때까지 기다리는 시간.
 # 로봇은 수신 즉시 State 를 보내지만, 큰 맵 경로계획 중 연결 지연까지 넉넉히 둔다.
 ORDER_ACK_TIMEOUT = 60.0
+# 호출 단계(탑승 전)에서 이만큼 기다리면 임대를 반납하고 다른 승강기로 다시 계획한다. 후보가 없으면 계속 기다린다.
+ELEVATOR_WAIT_TIMEOUT = 120.0
 
 
 class JobError(Exception):
@@ -52,6 +54,10 @@ class JobError(Exception):
 
 class JobNotFound(JobError):
     """job 을 못 찾음 (HTTP 404 급)."""
+
+
+class JobConflict(JobError):
+    """지금 상태로는 할 수 없음 (HTTP 409 급)."""
 
 
 class JobStatus(str, Enum):
@@ -370,6 +376,19 @@ class JobStore:
         log.info("job 생성: %s (명령 %d개, 로봇 %s)", job_id, len(parsed), robot_id or "-")
         return job
 
+    def create_system(self, site_id: str, robot_id: str, plan: list[dict], system: str, label: str) -> Job:
+        """목적지 명령 없이 stage 계획만 가진 시스템 작업 (승강기 칸 내 복구)."""
+        _check_seg(site_id, "site_id")
+        _check_seg(robot_id, "robot_id")
+        with self._lock:
+            n = self._seq.get(site_id, 0) + 1
+            self._seq[site_id] = n
+            job = Job(job_id=f"{site_id}-J{n:04d}", site_id=site_id, commands=[], robot_id=robot_id,
+                      plan=copy.deepcopy(plan), system=system, preset_name=label)
+            self._jobs[job.job_id] = job
+            self._persist_site(site_id)
+        return job
+
     def by_external_id(self, site_id: str, external_id: str) -> Optional[Job]:
         with self._lock:
             return next((j for j in self._jobs.values()
@@ -560,12 +579,49 @@ class JobCoordinator:
 
     def start(self) -> None:
         self._unsubscribe = self._fleet.add_listener(self._on_fleet_event)
+        self._reconcile_elevator_leases()
         log.info("job 코디네이터 시작")
 
     def stop(self) -> None:
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
+
+    def _ctl_do(self, name: str, *args, default=None):
+        """승강기 제어기의 선택 기능 호출 (테스트용 가짜 제어기에는 없을 수 있다)."""
+        method = getattr(self._ctl, name, None) if self._ctl is not None else None
+        return method(*args) if method is not None else default
+
+    def _reconcile_elevator_leases(self) -> None:
+        """재시작 때 복원한 임대 중 주인 작업이 없거나 이미 끝난 것은 놓는다 ("확인 필요"는 유지)."""
+        with self._lock:
+            for eid, owner in (self._ctl_do("all_leases", default={}) or {}).items():
+                if self._ctl_do("attention", eid):
+                    continue
+                try:
+                    alive = not self._store.get(owner).status.terminal
+                except JobNotFound:
+                    alive = False
+                if not alive:
+                    log.warning("승강기 %s 임대 주인 %s 이(가) 없다 — 임대 해제", eid, owner)
+                    self._ctl.release_lease(eid, owner)
+
+    def in_car(self, job: Job) -> Optional[str]:
+        """다층 작업의 로봇이 승강기 칸 안(탑승 오더를 보낸 뒤 ~ 임대 반납 전)이면 그 승강기 id."""
+        if not job.plan or self._ctl is None or job.stage >= len(job.plan):
+            return None
+        for index, stage in enumerate(job.plan):
+            if stage["t"] != "call" or self._ctl.lease_owner(stage["elevator_id"]) != job.job_id:
+                continue
+            eid = stage["elevator_id"]
+            release = next((i for i in range(index + 1, len(job.plan))
+                            if job.plan[i]["t"] == "release" and job.plan[i]["elevator_id"] == eid), len(job.plan))
+            if job.stage <= index or job.stage > release:
+                continue
+            if job.stage == index + 1 and "sent_at" not in job.stage_data:
+                continue   # 탑승 오더를 아직 안 보냈다 — 승강장 밖
+            return eid
+        return None
 
     # -- 디스패치 (API 핸들러) --------------------------------------
 
@@ -688,7 +744,8 @@ class JobCoordinator:
             busy = frozenset(e for e in (st.get("elevator_id") for j in self._store.list() if j.plan and not j.status.terminal
                                          and j.job_id != job.job_id for st in j.plan) if e)
             plan = build_plan(job.commands, resolved, start_map, job.site_id, elevators, registry=self._registry,
-                              start_xy=(pose.x, pose.y) if pose else None, avoid=busy)
+                              start_xy=(pose.x, pose.y) if pose else None, avoid=busy,
+                              unavailable=self._ctl_do("unavailable", default=frozenset()))
         except RouteError as exc:
             raise JobError(str(exc)) from None
         job.robot_id = robot_id
@@ -729,9 +786,17 @@ class JobCoordinator:
         """job 이 잡고 있는 승강기를 놓는다 (실패/취소 때)."""
         if self._ctl is None:
             return
+        inside = self.in_car(job) if job.status != JobStatus.SUCCESS else None
+        self._ctl_do("forget", job.job_id)
         for st in job.plan:
             eid = st.get("elevator_id")
             if eid and self._ctl.lease_owner(eid) == job.job_id:
+                if eid == inside and hasattr(self._ctl, "mark_attention"):
+                    # 로봇이 칸 안에 남았을 수 있다. 임대와 문 열림(hold)을 유지하고 운영자 확인을 기다린다.
+                    if not self._ctl.attention(eid):
+                        self._ctl.mark_attention(eid, job.job_id, job.robot_id,
+                                                 f"작업 {job.job_id} {'취소' if job.status == JobStatus.CANCELED else '실패'} — 로봇이 칸 안")
+                    continue
                 self._ctl.release(eid)
                 self._ctl.release_lease(eid, job.job_id)
 
@@ -835,6 +900,21 @@ class JobCoordinator:
 
         if kind == "call":
             eid, map_id = stage["elevator_id"], stage["map_id"]
+            sd.setdefault("wait0", now)
+            car_now = ctl.state(eid)
+            broken = (car_now is not None and not getattr(car_now, "in_service", True)) or bool(self._ctl_do("attention", eid))
+            if broken or now - sd["wait0"] > ELEVATOR_WAIT_TIMEOUT:
+                why = "장애" if broken else f"호출 대기 {ELEVATOR_WAIT_TIMEOUT:.0f}초 초과"
+                if self._reroute(job, eid, why):
+                    return True
+                sd["wait0"] = now     # 예비 승강기가 없다 — 계속 기다리고 알린다
+                if broken:
+                    msg = f"승강기 {eid} 장애 — 예비 승강기 없음, 복구 대기"
+                    if job.error != msg:
+                        job.error = msg
+                        self._store.save(job)
+                    sd["t0"] = now
+                    return False
             ride = next((st for st in job.plan[job.stage+1:] if st["t"] == "ride"), None)
             if ride and not self.traffic.acquire_floor(job, ride["to_map"], future=True):
                 job.error = "도착 층 동시 이동 대수 제한 — 탑승 전 대기"
@@ -956,6 +1036,125 @@ class JobCoordinator:
 
         self._fail_multi(job, f"알 수 없는 stage {kind!r}")
         return False
+
+    def _reroute(self, job: Job, eid: str, why: str) -> bool:
+        """탑승 전(호출 단계)인 작업을 다른 승강기로 돌린다. 계획을 바꿨으면 True."""
+        from fms_server.route import RouteError, build_plan
+        elevators = self._elevators()
+        stage = job.plan[job.stage]
+        record = self._fleet.get(job.robot_id)
+        if elevators is None or record is None or record.state is None:
+            return False
+        done = job.done_commands
+        commands = job.commands[done:]
+        resolved = job.resolved_steps[done:]
+        if not commands:
+            return False
+        busy = frozenset(e for e in (st.get("elevator_id") for j in self._store.list() if j.plan and not j.status.terminal
+                                     and j.job_id != job.job_id for st in j.plan) if e)
+        unavailable = frozenset(self._ctl_do("unavailable", default=frozenset())) | {eid}
+        try:
+            plan = build_plan(commands, resolved, stage["map_id"], job.site_id, elevators, registry=self._registry,
+                              start_xy=(record.state.pose.x, record.state.pose.y), avoid=busy, unavailable=unavailable)
+        except RouteError:
+            if not job.stage_data.get("no_backup"):
+                job.stage_data["no_backup"] = True
+                self._event("elevator.reroute", job, "warning", elevator_id=eid, reason=why, result="예비 승강기 없음")
+            return False
+        for st in plan:   # 잘라낸 명령 기준 번호를 원래 번호로 되돌린다
+            for node in st.get("nodes", []):
+                if node.get("cmd") is not None:
+                    node["cmd"] += done
+        if self._ctl.lease_owner(eid) == job.job_id:
+            self._ctl.release(eid)
+            self._ctl.release_lease(eid, job.job_id)
+        self._ctl_do("forget", job.job_id)
+        job.plan = job.plan[:job.stage] + plan
+        job.stage_data = {}
+        job.error = None
+        job.touch()
+        self._store.save(job)
+        new = next((st["elevator_id"] for st in plan if st["t"] == "call"), None)
+        self._event("elevator.reroute", job, "warning", elevator_id=eid, to=new, reason=why)
+        log.info("job %s 승강기 %s -> %s 전환 (%s)", job.job_id, eid, new, why)
+        return True
+
+    # -- 승강기 칸 내 복구 (운영자) ------------------------------------
+
+    @_serialized
+    def recover_elevator(self, site_id: str, elevator_id: str, robot_id: Optional[str], action: str,
+                         *, actor: Optional[str] = None) -> dict:
+        """'확인 필요' 승강기를 푼다.
+
+        - release: 칸이 비었음을 운영자가 확인했다. 문 열림을 풀고 임대를 놓는다.
+        - exit: 지금 층 문이 열려 있을 때 로봇에 후진 하차 STRAIGHT 오더를 보낸다. 칸이 다른 층에 서 있으면
+          하차 뒤 그 층 맵으로 바꾸고 위치를 다시 잡는다. 끝나면 임대를 놓는다.
+        """
+        from fms_server.route import ELEVATOR_STRAIGHT_SPEED, _node
+        ctl = self._ctl
+        if ctl is None or not hasattr(ctl, "attention"):
+            raise JobError("엘리베이터 제어기가 없다")
+        attention = ctl.attention(elevator_id)
+        if attention is None:
+            raise JobConflict(f"승강기 {elevator_id} 는 확인 필요 상태가 아니다")
+        owner = ctl.lease_owner(elevator_id)
+        robot_id = robot_id or attention.get("robot_id")
+        if action == "release":
+            ctl.release(elevator_id)
+            if owner:
+                ctl.release_lease(elevator_id, owner)
+            ctl.clear_attention(elevator_id)
+            self._event("elevator.recover", site_id=site_id, robot_id=robot_id, elevator_id=elevator_id,
+                        action="release", actor=actor)
+            return {"elevator_id": elevator_id, "action": "release", "job_id": None}
+        if action != "exit":
+            raise JobError("action 은 exit 또는 release")
+        if not robot_id:
+            raise JobError("하차시킬 로봇을 지정하세요")
+        elevators = self._elevators()
+        elevator = elevators.get(site_id, elevator_id)
+        assignment = self._registry.assignment_for(robot_id)
+        record = self._fleet.get(robot_id)
+        if assignment is None or assignment.site_id != site_id or record is None or record.state is None:
+            raise JobError(f"로봇 {robot_id} 의 상태를 알 수 없다")
+        if not record.available_for_job(self._fleet.stale_after):
+            raise JobConflict(f"로봇 {robot_id} 가 오더를 받을 수 없는 상태다 ({record.state.display_state})")
+        if any(j.robot_id == robot_id and j.status in (JobStatus.ASSIGNED, JobStatus.WORKING, JobStatus.CANCELING)
+               for j in self._store.list()):
+            raise JobConflict(f"로봇 {robot_id} 의 이전 작업이 아직 끝나지 않았다")
+        car = ctl.state(elevator_id)
+        if car is None or car.at is None or car.door != "OPEN":
+            raise JobConflict("승강기 문이 열려 있지 않다 — 문이 열린 층에서만 하차시킬 수 있다")
+        stops = {s.map_id: s for s in elevator.stops}
+        if assignment.map_id not in stops or car.at not in stops:
+            raise JobError("로봇의 맵 또는 승강기가 선 층이 이 승강기의 정지 층이 아니다")
+        here = elevators.geometry(site_id, stops[assignment.map_id])
+        there = elevators.geometry(site_id, stops[car.at])
+        pose = record.state.pose
+        plan = [{"t": "order", "map_id": assignment.map_id, "label": f"승강기 {elevator_id} 하차 (후진, 복구)", "nodes": [
+            _node((pose.x, pose.y, here.inside[2]), action={
+                "type": "straight", "params": {"distance": -there.distance, "speed": ELEVATOR_STRAIGHT_SPEED}})]},
+            {"t": "release", "elevator_id": elevator_id}]
+        if car.at != assignment.map_id:
+            plan += [{"t": "switch", "from_map": assignment.map_id, "to_map": car.at},
+                     {"t": "localize", "map_id": car.at, "x": there.outside[0], "y": there.outside[1],
+                      "theta": there.outside[2], "ref_from": list(here.outside), "ref_to": list(there.outside)}]
+        job = self._store.create_system(site_id, robot_id, plan, "recover", "승강기 하차 복구")
+        if owner and not ctl.transfer(elevator_id, owner, job.job_id):
+            self._store.delete(job.job_id)
+            raise JobConflict("승강기 임대를 넘겨받지 못했다")
+        if not owner:
+            ctl.clear_attention(elevator_id)
+            ctl.acquire(elevator_id, job.job_id)
+            ctl.mark_attention(elevator_id, job.job_id, robot_id, "하차 복구 중")
+        job.order_id, job.order_update_id = job.job_id, 1
+        job.status = JobStatus.ASSIGNED
+        job.dispatched_at = _now_iso()
+        job.touch()
+        self._store.save(job)
+        self._event("elevator.recover", job, elevator_id=elevator_id, action="exit", actor=actor, floor=car.at)
+        self._step_multi(job)
+        return {"elevator_id": elevator_id, "action": "exit", "job_id": job.job_id}
 
     def _stage_order(self, job: Job, stage: dict, oid: str) -> Order:
         kinds = {"wait": ActionType.WAIT, "docking": ActionType.DOCK, "parking": ActionType.PARK,
@@ -1116,6 +1315,62 @@ class JobCoordinator:
             return
 
     @_serialized
+    def tick_safety(self, now: Optional[float] = None) -> dict:
+        """교착·정체 감지, 안전한 예약 회수, 유휴 로봇 비켜주기, 경로 교차 예고. 배정 루프가 1초마다 부른다."""
+        now = time.time() if now is None else now
+        traffic = self.traffic
+        analysis = traffic.analyze(now, self._ctl)
+        if analysis["deadlocks"]:
+            traffic.revoke_safe(analysis)
+        # 길을 막고 선 유휴 로봇을 대기 위치로 보낸다 (자동 충전·대기 관리자가 있을 때만).
+        requests, traffic.aside_requests = traffic.aside_requests, set()
+        if self.battery is not None:
+            for site_id, robot_id in sorted(requests):
+                try:
+                    self.battery.move_aside(site_id, robot_id)
+                except Exception:
+                    log.exception("비켜주기 실패 %s", robot_id)
+        # 경로 교차 예고 (실험). 자동 일시정지는 맵 옵션 conflict_pause 가 켜져 있을 때만.
+        if not getattr(self._mqtt, "connected", True):
+            return analysis
+        for conflict in traffic.path_conflicts(now):
+            a, b = conflict["robots"]
+            jobs = {rid: next((j for j in self._store.jobs_for_robot(rid)
+                               if j.status in (JobStatus.ASSIGNED, JobStatus.WORKING)), None) for rid in (a, b)}
+            assignment = self._registry.assignment_for(a)
+            if assignment is None:
+                continue
+            if conflict["new"]:
+                self._event("traffic.conflict", severity="warning", site_id=assignment.site_id,
+                            robots=[a, b], distance=conflict["distance"])
+            entry = traffic._conflicts[(a, b)]
+            if entry["paused"] or not traffic.options(assignment.site_id, assignment.map_id)["conflict_pause"]:
+                continue
+            # 우선순위 낮은 쪽(같으면 나중에 배정된 쪽)을 잠깐 세운다.
+            def rank(rid):
+                job = jobs[rid]
+                return (job.priority if job else -1000, -(_epoch(job.dispatched_at) or 0) if job else 0, rid)
+            loser = min((a, b), key=rank)
+            record = self._fleet.get(loser)
+            if record is None or record.state is None or record.state.paused:
+                continue
+            send_instant(self._mqtt, loser, InstantActionType.PAUSE)
+            entry["paused"] = loser
+            self._event("traffic.conflict_pause", site_id=assignment.site_id, robot_id=loser, robots=[a, b])
+        for (a, b), entry in traffic.cleared_conflicts(now):
+            loser = entry.get("paused")
+            if not loser:
+                continue
+            record = self._fleet.get(loser)
+            # 그사이 운영자·현장 정지가 건 일시정지는 풀지 않는다.
+            assignment = self._registry.assignment_for(loser)
+            held = assignment is not None and self._registry.get_site(assignment.site_id).paused_for(assignment.map_id)
+            if (record is not None and record.state is not None and record.state.paused and not held
+                    and record.state.pause_source is not None and record.state.pause_source.value == "FMS"):
+                send_instant(self._mqtt, loser, InstantActionType.RESUME)
+        return analysis
+
+    @_serialized
     def delete(self, job_id):
         if any(v['job'] == job_id for v in self.traffic.data['leases'].values()):
             raise JobError("교통 예약이 남은 작업은 삭제할 수 없습니다. 로봇의 정지·퇴장을 확인하세요.")
@@ -1216,10 +1471,10 @@ class JobCoordinator:
                 self._finish(job, JobStatus.SUCCESS, None)
 
     def _finish(self, job: Job, status: JobStatus, error: Optional[str]) -> None:
-        if job.plan:
-            self._release_elevators(job)
         job.status = status
         job.error = error
+        if job.plan:
+            self._release_elevators(job)
         job.touch()
         self._store.save(job)
         log.info("job %s -> %s%s", job.job_id, status.value, f" ({error})" if error else "")

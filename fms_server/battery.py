@@ -306,29 +306,11 @@ class BatteryManager:
 
     # -- 대피 pullover ----------------------------------------------------
 
-    def _in_car(self, job) -> bool:
-        """다층 작업이 승강기 칸 안(탑승 오더를 보낸 뒤 ~ 임대 반납 전)인가. 하차까지는 진행시킨다."""
-        ctl = getattr(self.coordinator, "_ctl", None)
-        if not job.plan or ctl is None or job.stage >= len(job.plan):
-            return False
-        for index, stage in enumerate(job.plan):
-            if stage["t"] != "call" or ctl.lease_owner(stage["elevator_id"]) != job.job_id:
-                continue
-            release = next((i for i in range(index + 1, len(job.plan))
-                            if job.plan[i]["t"] == "release" and job.plan[i]["elevator_id"] == stage["elevator_id"]),
-                           len(job.plan))
-            if job.stage <= index or job.stage > release:
-                continue
-            if job.stage == index + 1 and "sent_at" not in job.stage_data:
-                continue   # 탑승 오더를 아직 안 보냈다 — 승강장 밖
-            return True
-        return False
-
     def _cancel_for_evacuation(self, site, actor=None) -> list[str]:
         canceled = []
         for job in self.jobs.list(site.site_id):
             if (job.status not in (JobStatus.ASSIGNED, JobStatus.WORKING) or job.system == "evacuation"
-                    or self._in_car(job)):
+                    or self.coordinator.in_car(job)):
                 continue
             try:
                 self.coordinator.cancel(job.job_id, actor=actor or "system", reason="대피")

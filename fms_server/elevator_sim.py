@@ -49,11 +49,23 @@ class ElevatorCar:
         self._door_timer = 0.0
         self._open_timer = 0.0
         self._cur_hold = False
+        self.mode = P.MODE_NORMAL      # 장애 주입: NORMAL 이 아니면 요청을 받지 않고 그 자리에 선다
+        self.fault: str | None = None
         self.version = 0  # 상태가 바뀔 때마다 증가 (발행 판단용)
 
     @property
     def moving(self) -> bool:
         return self.at is None
+
+    def set_fault(self, mode: str, fault: str | None = None) -> bool:
+        """장애 주입·해제. 비정상이 되면 대기 중인 요청을 버린다 (이동 중이면 그 층까지는 간다)."""
+        if mode not in P.MODES:
+            return False
+        self.mode, self.fault = mode, (fault or None) if mode != P.MODE_NORMAL else None
+        if mode != P.MODE_NORMAL:
+            self.queue.clear()
+        self.version += 1
+        return True
 
     def command(self, ctype: str, map_id: str | None = None, hold: bool = False) -> bool:
         if ctype == P.CMD_RELEASE:
@@ -63,6 +75,8 @@ class ElevatorCar:
             return True
         if ctype not in (P.CMD_CALL, P.CMD_GO) or map_id not in self.stops:
             return False
+        if self.mode != P.MODE_NORMAL:
+            return False   # 장애 중에는 새 요청을 받지 않는다
         # 이미 그 층에 서 있고 문이 열려/열리는 중이면 바로 hold 만 건다
         if self.at == map_id and not self.queue and self.door in (P.DOOR_OPEN, P.DOOR_OPENING):
             self.held = self.held or hold
@@ -133,6 +147,7 @@ class ElevatorCar:
         return {
             "elevator_id": self.elevator_id, "timestamp": time.time(), "stops": self.stops,
             "at": self.at, "target": self.target, "door": self.door, "moving": self.moving, "held": self.held,
+            "mode": self.mode, "fault": self.fault,
         }
 
 
@@ -155,7 +170,8 @@ class BuiltinElevatorSim:
         self._client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
                                    client_id=f"{settings.mqtt_client_id}-elevator-sim", clean_session=True)
         self._client.reconnect_delay_set(min_delay=1, max_delay=30)
-        self._client.on_connect = lambda c, *_a: c.subscribe(f"{P.TOPIC_PREFIX}/+/cmd", 1)
+        self._client.on_connect = lambda c, *_a: c.subscribe(
+            [(f"{P.TOPIC_PREFIX}/+/cmd", 1), (P.topic_sim_fault("+"), 1)])
         self._client.on_message = self._on_message
 
     @staticmethod
@@ -185,9 +201,12 @@ class BuiltinElevatorSim:
     # -- MQTT --
     def _on_message(self, _c, _u, msg) -> None:
         parts = msg.topic.split("/")
-        if len(parts) != 4:
-            return
         try:
+            if len(parts) == 5 and parts[:3] == ["sim", "v1", "elevator"] and parts[4] == "fault":
+                self._inbox.put((parts[3], {"type": "_FAULT", **json.loads(msg.payload)}))
+                return
+            if len(parts) != 4:
+                return
             self._inbox.put((parts[2], json.loads(msg.payload)))
         except ValueError:
             log.warning("%s: 잘못된 cmd", msg.topic)
@@ -224,6 +243,10 @@ class BuiltinElevatorSim:
                     self.cars[eid] = new
                     log.info("가상 엘리베이터 %s 층 변경 (%s)", eid, "/".join(stops))
 
+    def inject_fault(self, elevator_id: str, mode: str, fault: str | None = None) -> None:
+        """장애 주입 (API 에서). 시뮬 스레드가 다음 tick 에 반영한다."""
+        self._inbox.put((elevator_id, {"type": "_FAULT", "mode": mode, "fault": fault}))
+
     def _run(self) -> None:
         last_sync = 0.0
         published: dict[str, tuple[int, float]] = {}
@@ -243,6 +266,10 @@ class BuiltinElevatorSim:
                 except queue_mod.Empty:
                     break
                 car = self.cars.get(eid)
+                if body.get("type") == "_FAULT":
+                    ok = car is not None and car.set_fault(str(body.get("mode")), body.get("fault"))
+                    log.info("가상 엘리베이터 %s 장애 주입 %s -> %s", eid, body.get("mode"), "ok" if ok else "무시")
+                    continue
                 ok = car is not None and car.command(str(body.get("type")), body.get("map_id"), bool(body.get("hold")))
                 log.info("가상 엘리베이터 %s %s %s hold=%s -> %s", eid, body.get("type"), body.get("map_id", ""),
                          body.get("hold", False), "ok" if ok else "무시")

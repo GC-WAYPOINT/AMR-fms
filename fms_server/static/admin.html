@@ -75,7 +75,7 @@
         <p id="zoneHint" role="status">맵에서 드래그해 사각형을 만드세요.</p>
         <form id="zoneForm">
           <label>구역 이름<input name="name" required maxlength="128" placeholder="구역 이름"></label>
-          <label id="zoneTypeLabel">구역 종류<select name="type"><option value="prohibit">주행금지구역 (Forbidden zone)</option><option value="elevator">엘리베이터 구역</option><option value="occupancy">점유 존 (한 대씩 통과)</option></select></label>
+          <label id="zoneTypeLabel">구역 종류<select name="type"><option value="prohibit">주행금지구역 (Forbidden zone)</option><option value="elevator">엘리베이터 구역</option><option value="occupancy">점유 존 (한 대씩 통과)</option><option value="oneway">일방통행 통로 (한 방향·한 대씩)</option></select></label>
           <div class="zone-dimensions">
             <label>기준 X (m)<input name="x" type="number" step="any" required title="회전 전 사각형의 왼쪽 위 X"></label>
             <label>기준 Y (m)<input name="y" type="number" step="any" required title="회전 전 사각형의 왼쪽 위 Y"></label>
@@ -201,7 +201,7 @@
     <section class="elevator-live" aria-label="승강기 운행 상태">
       <div class="elev-live-heading"><h3>승강기 운행 상태</h3><span id="elevatorStatusSource" class="muted">상태 확인 중</span></div>
       <p id="elevatorStatusNotice" class="muted" role="status" hidden></p>
-      <div class="table-wrap"><table><thead><tr><th>승강기</th><th>현재 층</th><th>동작 상태</th><th>목표 층</th><th>문 상태</th><th>수신 상태</th></tr></thead><tbody id="elevatorStatusRows"><tr><td colspan="6" class="empty-row">운행 상태를 확인합니다.</td></tr></tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>승강기</th><th>현재 층</th><th>동작 상태</th><th>목표 층</th><th>문 상태</th><th>수신 상태</th><th>임대·복구</th></tr></thead><tbody id="elevatorStatusRows"><tr><td colspan="7" class="empty-row">운행 상태를 확인합니다.</td></tr></tbody></table></div>
     </section>
     <div id="elevatorBody"></div>
   </section>
@@ -249,7 +249,7 @@
     <div class="page-heading"><div><h2>현장 설정</h2><p>현장을 등록하고 서버 연결 상태를 확인합니다.</p></div></div>
     <div class="panel"><h3>선택 맵 교통 제어</h3>
       <p id="trafficMapName" class="muted">상단에서 현장과 맵을 선택하세요.</p>
-      <form id="trafficForm"><label>동시 이동 허가 대수<input id="trafficLimit" type="number" min="1" step="1" placeholder="빈칸: 무제한"></label><button class="primary">적용</button></form>
+      <form id="trafficForm"><label>동시 이동 허가 대수<input id="trafficLimit" type="number" min="1" step="1" placeholder="빈칸: 무제한"></label><label class="check"><input type="checkbox" id="trafficConflictPause"> 경로 교차 예고 시 우선순위 낮은 로봇 일시정지 (실험)</label><button class="primary">적용</button></form>
       <p class="muted">작업 없는 주차·충전 로봇은 제외합니다. 실행 중 일시정지·점유 존 대기·액션은 허가를 유지합니다.</p>
       <div id="trafficStatus" role="status"></div>
     </div>

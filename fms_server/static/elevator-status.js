@@ -22,8 +22,10 @@
     const statusCell=el('td'),status=el('span',undefined,'elev-live-state');statusCell.append(status);
     const target=el('td'),door=el('td'),connectionCell=el('td'),connection=el('span'),updated=el('small',undefined,'elev-live-meta');
     connectionCell.append(connection,updated);
-    tr.append(identity,floorCell,statusCell,target,door,connectionCell);
-    const row={tr,name,id,floor,last,status,target,door,connection,updated};rows.set(e.elevator_id,row);return row;
+    // 임대·대기열·확인 필요와 복구 조작. 버튼은 상태가 바뀔 때만 다시 만든다 (포커스 유지).
+    const care=el('td'),careText=el('div'),careButtons=el('div',undefined,'elev-care-buttons');care.append(careText,careButtons);
+    tr.append(identity,floorCell,statusCell,target,door,connectionCell,care);
+    const row={tr,name,id,floor,last,status,target,door,connection,updated,careText,careButtons,careKey:null};rows.set(e.elevator_id,row);return row;
   }
   function render(data){
     const entries=data.elevators;
@@ -41,8 +43,29 @@
       // 이동 중 at=null이다. 임의로 출발층/도착층을 현재 층이라고 표시하지 않는다.
       set(row.floor,known?(s.moving?'층간 이동':s.current_floor||s.at||'—'):'—');
       row.last.hidden=!known||fresh;
-      set(row.status,!known?'상태 미수신':`${fresh?'':'마지막: '}${operation(s)}`);
-      row.status.dataset.tone=!fresh?'unknown':s.moving?'moving':s.door==='OPEN'?'open':'idle';
+      const faulty=known&&s.mode&&s.mode!=='NORMAL';
+      set(row.status,!known?'상태 미수신':faulty?`${s.mode==='FIRE'?'화재 운전':'운행 중지'}${s.fault?' · '+s.fault:''}`:`${fresh?'':'마지막: '}${operation(s)}`);
+      row.status.dataset.tone=!fresh?'unknown':faulty?'unknown':s.moving?'moving':s.door==='OPEN'?'open':'idle';
+      const a=s.attention;
+      set(row.careText,a?`확인 필요 · ${a.reason||''}`:[s.lease_owner?`사용 중: ${s.lease_owner}`:'비어 있음',s.queue?.length?`대기 ${s.queue.join(', ')}`:''].filter(Boolean).join(' · '));
+      row.careText.className=a?'bad':'';
+      const careKey=JSON.stringify([!!a,a?.robot_id,data.simulation_enabled,faulty]);
+      if(careKey!==row.careKey){
+        row.careKey=careKey;row.careButtons.replaceChildren();
+        const url=`/api/v1/sites/${enc(app.site)}/elevators/${enc(e.elevator_id)}`;
+        if(a){
+          row.careButtons.append(button('열린 문으로 하차',async()=>{
+            if(!confirm(`${a.robot_id||'로봇'}을(를) 지금 열린 문으로 후진 하차시킬까요? 문 앞이 비었는지 확인하세요.`))return;
+            await request(`${url}/recover`,'POST',{action:'exit',robot_id:a.robot_id||null});notify('하차 복구 오더를 보냈습니다.');
+          }),button('칸 비었음 확인',async()=>{
+            if(!confirm('칸 안에 로봇이 없음을 확인했습니까? 승강기를 다른 작업에 다시 내줍니다.'))return;
+            await request(`${url}/recover`,'POST',{action:'release'});notify('승강기 임대를 해제했습니다.');
+          },'danger'));
+        }
+        if(data.simulation_enabled)row.careButtons.append(button(faulty?'장애 해제 (시험)':'장애 주입 (시험)',async()=>{
+          await request(`${url}/fault`,'POST',faulty?{mode:'NORMAL'}:{mode:'OUT_OF_SERVICE',fault:'시험 주입'});
+        }));
+      }
       const target=s.target_floor||s.target;
       set(row.target,known&&target?`${target}${!s.moving&&s.at===s.target?' · 도착':''}`:'—');
       set(row.door,known?doorNames[s.door]||s.door||'—':'—');
@@ -54,7 +77,7 @@
       }else set(row.updated,'시뮬레이터/제어기 연결을 확인하세요.');
       body.append(row.tr);
     }
-    empty(body,6,'등록된 승강기가 없습니다. 아래에서 층별 구역을 연결하세요.');
+    empty(body,7,'등록된 승강기가 없습니다. 아래에서 층별 구역을 연결하세요.');
     notice.hidden=true;
   }
   async function poll(){
@@ -64,7 +87,7 @@
       siteKey=site;rows.clear();body.replaceChildren();notice.hidden=true;
       $('#elevatorStatusSource').textContent='상태 확인 중';
     }
-    if(!site){empty(body,6,'현장을 먼저 선택하세요.');return;}
+    if(!site){empty(body,7,'현장을 먼저 선택하세요.');return;}
     if(pending.has(site))return;
     pending.add(site);
     try{

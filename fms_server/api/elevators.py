@@ -86,6 +86,49 @@ def list_elevators(site_id: str, request: Request):
     return _wrap(run)
 
 
+class RecoverRequest(BaseModel):
+    robot_id: str | None = None
+    action: str = "exit"          # exit: 열린 문으로 후진 하차 / release: 칸이 비었음을 확인하고 임대 해제
+
+
+class FaultRequest(BaseModel):
+    mode: str = "OUT_OF_SERVICE"  # NORMAL | OUT_OF_SERVICE | FIRE
+    fault: str | None = None
+
+
+@router.post("/{elevator_id}/recover")
+def recover_elevator(site_id: str, elevator_id: str, body: RecoverRequest, request: Request):
+    """'확인 필요' 승강기 복구. 절차는 docs/elevators.md."""
+    from fms_server.api.events import actor_of
+    from fms_server.task import JobConflict, JobError
+    def run():
+        _store(request).get(site_id, elevator_id)
+        try:
+            return request.app.state.job_coordinator.recover_elevator(
+                site_id, elevator_id, body.robot_id, body.action, actor=actor_of(request))
+        except JobConflict as exc:
+            raise HTTPException(409, str(exc)) from None
+        except JobError as exc:
+            raise HTTPException(422, str(exc)) from None
+    return _wrap(run)
+
+
+@router.post("/{elevator_id}/fault")
+def inject_fault(site_id: str, elevator_id: str, body: FaultRequest, request: Request):
+    """내장 시뮬레이터에 장애를 주입·해제한다 (시험용). 실제 제어기를 쓸 때는 409."""
+    from common import elevator_proto as P
+    def run():
+        _store(request).get(site_id, elevator_id)
+        sim = getattr(request.app.state, "elevator_sim", None)
+        if sim is None:
+            raise HTTPException(409, "내장 시뮬레이터가 꺼져 있다 (FMS_ELEVATOR_SIM=0)")
+        if body.mode not in P.MODES:
+            raise HTTPException(422, f"mode 는 {', '.join(P.MODES)} 중 하나")
+        sim.inject_fault(elevator_id, body.mode, body.fault)
+        return {"elevator_id": elevator_id, "mode": body.mode}
+    return _wrap(run)
+
+
 @router.get("/unlinked")
 def unlinked(site_id: str, request: Request):
     def run():

@@ -22,6 +22,67 @@ class TrafficError(ValueError):
     pass
 
 
+STALL_MOVE_SECONDS = 60.0     # BUSY/MOVING 인데 이 시간 동안 STALL_DISTANCE 도 못 가면 정체
+STALL_DISTANCE = 0.3          # m
+STALL_WAIT_SECONDS = 180.0    # BUSY/WAITING 이 이 시간을 넘으면 정체
+CONFLICT_LOOKAHEAD = 5.0      # 경로 교차 예고: 앞으로 이 시간(초) 안에 지나갈 경로만 본다
+CONFLICT_MIN_SPEED = 0.3      # 남은 경로 길이를 정할 때 쓰는 최소 속도 (m/s)
+
+
+def find_cycles(edges):
+    """wait-for 그래프(로봇 -> 기다리는 상대 로봇)의 순환을 DFS 로 찾는다. 순환마다 로봇 목록 하나."""
+    graph = {}
+    for edge in edges:
+        graph.setdefault(edge["from"], []).append(edge["to"])
+    cycles, seen_keys = [], set()
+    color, stack = {}, []
+
+    def visit(node):
+        color[node] = 1
+        stack.append(node)
+        for nxt in graph.get(node, []):
+            if color.get(nxt) == 1:
+                cycle = stack[stack.index(nxt):]
+                key = frozenset(cycle)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    cycles.append(list(cycle))
+            elif nxt not in color:
+                visit(nxt)
+        stack.pop()
+        color[node] = 2
+
+    for node in sorted(graph):
+        if node not in color:
+            visit(node)
+    return cycles
+
+
+def _path_ahead(state, horizon):
+    """로봇이 앞으로 horizon 초 동안 지나갈 경로 점들 (현재 위치 포함)."""
+    budget = max(abs(state.velocity), CONFLICT_MIN_SPEED) * horizon
+    points = [(state.pose.x, state.pose.y)]
+    for p in state.local_path:
+        step = math.hypot(p.x - points[-1][0], p.y - points[-1][1])
+        if step > budget:
+            ratio = budget / step if step else 0
+            points.append((points[-1][0] + (p.x - points[-1][0]) * ratio,
+                           points[-1][1] + (p.y - points[-1][1]) * ratio))
+            break
+        budget -= step
+        points.append((p.x, p.y))
+    return points
+
+
+def _sample(points, spacing=0.15):
+    out = [points[0]]
+    for a, b in zip(points, points[1:]):
+        length = math.hypot(b[0] - a[0], b[1] - a[1])
+        steps = max(1, int(length / spacing))
+        out.extend((a[0] + (b[0] - a[0]) * i / steps, a[1] + (b[1] - a[1]) * i / steps) for i in range(1, steps + 1))
+    return out
+
+
 def bounds(zone):
     return rectangle_frame(zone.polygon)
 
@@ -151,9 +212,15 @@ class TrafficController:
     def __init__(self, registry, fleet, jobs, events=None):
         self.registry, self.fleet, self.jobs = registry, fleet, jobs
         self.events = events
+        self.aside_requests = set()   # (site_id, robot_id): 길을 막고 선 유휴 로봇. 코디네이터가 대기 위치로 보낸다
+        self._motion = {}             # robot_id -> 정체 판정용 {x, y, since, waiting_since, reported}
+        self._deadlocks = {}          # frozenset(로봇) -> 처음 본 시각 (같은 순환을 반복 기록하지 않는다)
+        self._conflicts = {}          # (로봇 a, 로봇 b) -> {since, last, paused}
+        self.analysis = {"edges": [], "deadlocks": [], "stalls": [], "conflicts": []}
         self.path = Path(registry._sites_root).parent / "traffic.json"
         self.data = (json.loads(self.path.read_text()) if self.path.exists()
                      else {"limits": {}, "leases": {}})
+        self.data.setdefault("options", {})
         self.planners = {}
 
     def _event(self, kind, lease, resource, **data):
@@ -196,6 +263,14 @@ class TrafficController:
         self.data["limits"][self.key(site, map_id)] = limit
         self.save()
 
+    def options(self, site, map_id):
+        """맵별 선택 기능. conflict_pause: 경로 교차 예고 때 우선순위 낮은 로봇을 잠깐 세운다 (기본 끔)."""
+        return dict({"conflict_pause": False}, **self.data["options"].get(self.key(site, map_id), {}))
+
+    def set_options(self, site, map_id, **options):
+        self.data["options"].setdefault(self.key(site, map_id), {}).update(options)
+        self.save()
+
     def snapshot(self, site, map_id):
         key = self.key(site, map_id)
         store = self.registry.map_store(site)
@@ -217,7 +292,14 @@ class TrafficController:
             status = 'blocked' if unknown or unauthorized else 'occupied' if occupants else 'reserved' if lease else 'free'
             zones.append({'zone_id':z.zone_id,'name':z.name,'status':status,
                           'owner':(lease or {}).get('robot'),'occupants':occupants})
+        on_map = {r.robot_id for r in records if r.state and r.state.map_id == uid}
+        on_map.update(a.robot_id for a in self.registry.get_site(site).robots.values() if a.map_id == map_id)
+        analysis = self.analysis
         return {"max_moving_robots": self.limit(site, map_id),
+                "conflict_pause": self.options(site, map_id)["conflict_pause"],
+                "deadlocks": [d for d in analysis["deadlocks"] if set(d["robots"]) & on_map],
+                "stalls": [s for s in analysis["stalls"] if s["robot_id"] in on_map],
+                "conflicts": [c for c in analysis["conflicts"] if set(c["robots"]) & on_map],
                 "zones": zones,
                 "leases": [dict(v, resource=k) for k, v in self.data["leases"].items() if v["map"] == key],
                 "waiting": [{"job_id": j.job_id, "robot_id": j.robot_id,
@@ -314,6 +396,10 @@ class TrafficController:
     def _clear_space(self, job, pose, margin):
         for r in self._peers(job):
             if not self.fresh(r) or math.hypot(r.state.pose.x-pose.x, r.state.pose.y-pose.y) <= margin+radius(r.state):
+                if r is not None and r.state is not None and r.available_for_job(self.fleet.stale_after):
+                    # 작업 없이 서 있는 로봇이 길을 막는다 — 대기 위치로 비켜 달라고 요청해 둔다.
+                    self.aside_requests.add((job.site_id, r.robot_id))
+                    job.traffic["blocked_by"] = r.robot_id
                 return False
         for lease in self.data['leases'].values():
             if lease['map'] != job.traffic['map'] or lease['robot'] == job.robot_id or 'pose' not in lease:
@@ -455,3 +541,196 @@ class TrafficController:
         order.order_update_id += 1
         order.timestamp = time.time()
         return order
+
+    # -- 교착·정체 감지 ----------------------------------------------------
+
+    def wait_graph(self, elevator_ctl=None):
+        """wait-for 간선: "로봇 A 가 B 가 가진 자원(존·대기 node·층 정원·승강기 임대)을 기다림"."""
+        leases = self.data["leases"]
+        active = [j for j in self.jobs.list() if not j.status.terminal and j.robot_id and j.status.value != "pending"]
+        robot_of = {j.job_id: j.robot_id for j in active}
+        edges = []
+
+        def add(job, other, resource):
+            if other and other != job.robot_id:
+                edges.append({"from": job.robot_id, "to": other, "resource": resource,
+                              "job_id": job.job_id, "site_id": job.site_id})
+
+        for job in active:
+            t = job.traffic
+            waiting = t.get("waiting") if t else None
+            if waiting:
+                key = t["map"]
+                current = next((c for c in t.get("crossings", []) if not c["done"]), None)
+                if waiting == "층별 동시 이동 대수 제한":
+                    for resource, lease in leases.items():
+                        if lease["kind"] == "floor" and lease["map"] == key:
+                            add(job, lease["robot"], resource)
+                elif current is not None:
+                    zone_key = f'zone:{key}:{current["zone"]}'
+                    wait_key = f'wait:{key}:{current["zone"]}:{current["gate"]}'
+                    if waiting == "대기 node 사용 중" and wait_key in leases:
+                        add(job, leases[wait_key]["robot"], wait_key)
+                    elif waiting == "점유 존 진입 허가 대기":
+                        if zone_key in leases:
+                            add(job, leases[zone_key]["robot"], zone_key)
+                        for r in self.fleet.all():
+                            if (r.state and r.state.map_id == t.get("uid")
+                                    and intersects(current["bounds"], r.state.pose, radius(r.state))):
+                                add(job, r.robot_id, zone_key)
+                    elif waiting == "대기 node 주변 확인 대기":
+                        add(job, t.get("blocked_by"), wait_key)
+                        for resource, lease in leases.items():
+                            if lease["map"] == key and "pose" in lease and resource != wait_key:
+                                add(job, lease["robot"], resource)
+            # 다층 작업의 호출 단계: 승강기 임대·도착 층 정원
+            if job.plan and job.stage < len(job.plan) and job.plan[job.stage]["t"] == "call":
+                stage = job.plan[job.stage]
+                if elevator_ctl is not None:
+                    owner = elevator_ctl.lease_owner(stage["elevator_id"])
+                    if owner and owner != job.job_id:
+                        add(job, robot_of.get(owner), f'elevator:{stage["elevator_id"]}')
+                ride = next((st for st in job.plan[job.stage + 1:] if st["t"] == "ride"), None)
+                if ride is not None and job.error and "도착 층" in job.error:
+                    key = self.key(job.site_id, ride["to_map"])
+                    for resource, lease in leases.items():
+                        if lease["kind"] == "floor" and lease["map"] == key:
+                            add(job, lease["robot"], resource)
+        return edges
+
+    def analyze(self, now=None, elevator_ctl=None):
+        """교착(진짜 순환)과 정체(안 움직임)를 구분해 찾고 이벤트로 남긴다. 결과는 `self.analysis`."""
+        now = time.time() if now is None else now
+        edges = self.wait_graph(elevator_ctl)
+        cycles = find_cycles(edges)
+        deadlocks = []
+        for cycle in cycles:
+            key = frozenset(cycle)
+            resources = sorted({e["resource"] for e in edges if e["from"] in key and e["to"] in key})
+            site = next((e["site_id"] for e in edges if e["from"] in key), None)
+            since = self._deadlocks.get(key)
+            if since is None:
+                since = self._deadlocks[key] = now
+                if self.events is not None:
+                    self.events.record("traffic.deadlock", site_id=site, severity="error",
+                                       robots=sorted(cycle), resources=resources)
+            deadlocks.append({"robots": sorted(cycle), "resources": resources, "since": since, "site_id": site})
+        for key in [k for k in self._deadlocks if k not in {frozenset(c) for c in cycles}]:
+            del self._deadlocks[key]
+
+        in_cycle = {r for c in cycles for r in c}
+        stalls = []
+        busy = {j.robot_id: j for j in self.jobs.list() if j.status.value == "working" and j.robot_id}
+        for robot_id in [r for r in self._motion if r not in busy]:
+            del self._motion[robot_id]
+        for robot_id, job in busy.items():
+            r = self.fleet.get(robot_id)
+            if not self.fresh(r) or r.state.state != RobotState.BUSY or r.state.paused:
+                self._motion.pop(robot_id, None)
+                continue
+            s = r.state
+            m = self._motion.setdefault(robot_id, {"x": s.pose.x, "y": s.pose.y, "since": now,
+                                                   "waiting_since": None, "reported": False})
+            sub = s.sub_state.value if s.sub_state else None
+            if math.hypot(s.pose.x - m["x"], s.pose.y - m["y"]) >= STALL_DISTANCE:
+                m.update(x=s.pose.x, y=s.pose.y, since=now, reported=False)
+            m["waiting_since"] = (m["waiting_since"] or now) if sub == "WAITING" else None
+            kind = seconds = None
+            if sub == "MOVING" and now - m["since"] >= STALL_MOVE_SECONDS:
+                kind, seconds = "moving", now - m["since"]
+            elif sub == "WAITING" and now - m["waiting_since"] >= STALL_WAIT_SECONDS:
+                kind, seconds = "waiting", now - m["waiting_since"]
+            if kind is None:
+                m["reported"] = False
+                continue
+            stalls.append({"robot_id": robot_id, "job_id": job.job_id, "kind": kind, "seconds": round(seconds, 1),
+                           "in_deadlock": robot_id in in_cycle, "reason": job.traffic.get("waiting") or job.error})
+            # 순환에 든 로봇은 교착으로 이미 알렸다. 정체는 순환이 아닌 것만 따로 알린다.
+            if not m["reported"] and robot_id not in in_cycle:
+                m["reported"] = True
+                if self.events is not None:
+                    self.events.record("traffic.stall", site_id=job.site_id, robot_id=robot_id, job_id=job.job_id,
+                                       severity="warning", stall=kind, seconds=round(seconds, 1),
+                                       reason=job.traffic.get("waiting") or job.error)
+        self.analysis = {"edges": edges, "deadlocks": deadlocks, "stalls": stalls,
+                         "conflicts": self.analysis.get("conflicts", [])}
+        return self.analysis
+
+    def revoke_safe(self, analysis=None):
+        """교착 자동 해소. **아직 로봇에 허가를 내보내지 않은 예약**만 가장 늦은 것부터 회수한다.
+
+        회수 대상은 탑승 전 도착 층 예약(`future` floor lease)뿐이다 — 그 층으로 가는 오더를 아직 보내지 않았다.
+        대기 node·점유 존 예약은 잡는 즉시 통행 허가(released)로 나가므로 회수하지 않는다 (기존 불변식:
+        점유 중 존·발행된 허가는 새 State 의 증거로만 푼다). 회수한 예약 목록을 돌려준다.
+        """
+        analysis = analysis or self.analysis
+        revoked = []
+        for deadlock in analysis["deadlocks"]:
+            members = set(deadlock["robots"])
+            candidates = [(lease["at"], resource) for resource, lease in self.data["leases"].items()
+                          if resource in deadlock["resources"] and lease["kind"] == "floor"
+                          and lease.get("future") and lease["robot"] in members]
+            if not candidates:
+                continue
+            _, resource = max(candidates)
+            lease = self.data["leases"].pop(resource)
+            revoked.append(resource)
+            if self.events is not None:
+                self.events.record("traffic.revoke", site_id=lease["map"].split("/", 1)[0], robot_id=lease["robot"],
+                                   job_id=lease["job"], severity="warning", resource=resource,
+                                   reason="교착 해소 — 탑승 전 도착 층 예약 회수")
+        if revoked:
+            self.save()
+        return revoked
+
+    # -- 경로 교차 예고 (실험) ---------------------------------------------
+
+    def path_conflicts(self, now=None):
+        """같은 맵 두 로봇의 남은 경로(`State.local_path`)가 곧 가까워지는지 본다. 점유 존 밖 마주침 예고용.
+
+        돌려주는 값: [{robots:[a,b], distance, new}] — new 는 이번에 처음 잡힌 쌍.
+        """
+        now = time.time() if now is None else now
+        moving = [r for r in self.fleet.all()
+                  if self.fresh(r) and r.state.state == RobotState.BUSY and r.state.local_path and r.state.map_id]
+        found = {}
+        for i, a in enumerate(moving):
+            for b in moving[i + 1:]:
+                if a.state.map_id != b.state.map_id:
+                    continue
+                if abs(a.state.velocity) < 0.01 and abs(b.state.velocity) < 0.01:
+                    continue
+                limit = radius(a.state) + radius(b.state)
+                pa = _sample(_path_ahead(a.state, CONFLICT_LOOKAHEAD))
+                pb = _sample(_path_ahead(b.state, CONFLICT_LOOKAHEAD))
+                # 같은 시각쯤에 지나는 점끼리만 비교한다 (경로가 겹쳐도 시간이 어긋나면 괜찮다).
+                va = max(abs(a.state.velocity), CONFLICT_MIN_SPEED)
+                vb = max(abs(b.state.velocity), CONFLICT_MIN_SPEED)
+                best = math.inf
+                for ia, p in enumerate(pa):
+                    ta = ia * 0.15 / va
+                    for ib, q in enumerate(pb):
+                        if abs(ta - ib * 0.15 / vb) > 1.5:
+                            continue
+                        best = min(best, math.hypot(p[0] - q[0], p[1] - q[1]))
+                if best <= limit:
+                    found[tuple(sorted((a.robot_id, b.robot_id)))] = best
+        out = []
+        for pair, distance in found.items():
+            entry = self._conflicts.get(pair)
+            new = entry is None
+            if new:
+                entry = self._conflicts[pair] = {"since": now, "paused": None}
+            entry["last"] = now
+            out.append({"robots": list(pair), "distance": round(distance, 2), "new": new, "since": entry["since"],
+                        "paused": entry["paused"]})
+        self.analysis["conflicts"] = out
+        return out
+
+    def cleared_conflicts(self, now=None, hold=3.0):
+        """더는 잡히지 않는 쌍 (hold 초 동안 안 보이면 해소). [(pair, entry)] 를 돌려주고 기억에서 지운다."""
+        now = time.time() if now is None else now
+        gone = [(pair, entry) for pair, entry in self._conflicts.items() if now - entry["last"] >= hold]
+        for pair, _ in gone:
+            del self._conflicts[pair]
+        return gone

@@ -72,7 +72,8 @@ async def lifespan(app: FastAPI):
     coordinator = SiteCoordinator(fleet, registry, mqtt, settings.public_url)
     broadcaster = FleetBroadcaster(fleet, registry)
     jobs = JobStore(settings.data_root)
-    elevator_ctl = ElevatorController(settings, events=events)
+    elevator_ctl = ElevatorController(settings, events=events,
+                                      lease_path=Path(settings.data_root) / "elevator_leases.json")
     robot_events = RobotEventRecorder(fleet, registry, events)
 
     def elevator_store():

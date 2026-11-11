@@ -32,6 +32,7 @@ def ensure_robot_editable(request, robot_id, site_id=None, map_id=None):
 class TrafficSettings(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     max_moving_robots: int | None = Field(default=None, ge=1)
+    conflict_pause: bool | None = None   # 경로 교차 예고 때 우선순위 낮은 로봇을 잠깐 세운다 (실험, 기본 끔)
 
 
 def coordinator(request, site_id, map_id):
@@ -53,9 +54,15 @@ def get_traffic(site_id: str, map_id: str, request: Request):
 def set_traffic(site_id: str, map_id: str, body: TrafficSettings, request: Request):
     coord = coordinator(request, site_id, map_id)
     with coord.lock:
+        only_option = body.conflict_pause is not None and 'max_moving_robots' not in body.model_fields_set
+        if only_option:   # 정원은 그대로 두고 선택 기능만 바꾼다
+            coord.traffic.set_options(site_id, map_id, conflict_pause=body.conflict_pause)
+            return coord.traffic.snapshot(site_id, map_id)
         # 제한 신설 시 기존 오더의 허가를 취소하지 않는다.
         if any(j.site_id == site_id and not j.status.terminal and j.status.value != 'pending'
                and not j.traffic for j in request.app.state.jobs.list(site_id)):
             raise HTTPException(409, '기존 작업을 종료한 뒤 이동 제한을 설정하세요.')
         coord.traffic.set_limit(site_id, map_id, body.max_moving_robots)
+        if body.conflict_pause is not None:
+            coord.traffic.set_options(site_id, map_id, conflict_pause=body.conflict_pause)
         return coord.traffic.snapshot(site_id, map_id)

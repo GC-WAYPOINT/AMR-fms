@@ -138,15 +138,16 @@ def path_distances(model, start_xy, goals) -> list[float]:
 
 def build_plan(commands, resolved: list[dict], start_map: str, site_id: str, elevators: ElevatorStore,
                *, registry=None, start_xy: Optional[tuple[float, float]] = None,
-               avoid: frozenset = frozenset()) -> list[dict]:
+               avoid: frozenset = frozenset(), unavailable: frozenset = frozenset()) -> list[dict]:
     """commands[i] 는 resolved[i] = {map_id, pose} 를 가진다. start_map 은 로봇이 지금 있는 맵.
 
     같은 층 쌍을 잇는 승강기가 여럿이면 지금 위치(start_xy, 없으면 직전 목적지)에서 승강장까지 주행 거리가
     가장 짧은 것을 탄다. avoid 에 든 승강기 id 는 다른 후보가 있을 때만 피한다 (다른 job 이 계획에 쓰는 중).
+    unavailable 에 든 승강기(장애·확인 필요)는 아예 없는 것으로 본다 — 환승 경로(`_find_hops`)에서도 뺀다.
     """
     from fms_server.task import ActionCommand  # 순환 import 회피
 
-    all_elevators = elevators.list(site_id)
+    all_elevators = [e for e in elevators.list(site_id) if e.elevator_id not in unavailable]
     store = (registry or elevators._registry).map_store(site_id)
     plan: list[dict] = []
     group: list[dict] = []

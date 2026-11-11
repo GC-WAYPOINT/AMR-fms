@@ -69,10 +69,15 @@ window.zoneEditor = (() => {
       : pickup ? '적재 장치·컨베이어가 있는 영역을 드래그해 사각형으로 그리세요.'
       : '맵에서 드래그해 사각형을 만드세요.';
   }
+  // 일방통행 통로 = 진입 방향(gate)이 하나뿐인 점유 존. 저장 형식은 점유 존과 같다 (새 로직 없음).
+  const oneway = () => field('type').value === 'oneway';
+  const occupancy = () => ['occupancy', 'oneway'].includes(field('type').value);
   function sync() {
+    $('#addTrafficGate').hidden = oneway();
     $('#trafficGateFields').hidden = pickup || field('type').value !== 'occupancy';
-    if (!pickup) $('#zoneDescription').textContent = field('type').value === 'occupancy'
-      ? '한 대씩 통과합니다. 대기·출구는 차체 여유를 두고 배치하세요. 저장하면 새 맵 버전을 로봇에 전달합니다.'
+    if (!pickup) $('#zoneDescription').textContent = occupancy()
+      ? (oneway() ? '대기 node 에서 출구 node 방향으로만, 한 대씩 통과합니다. 반대 방향 진입로는 만들지 않습니다. 저장하면 새 맵 버전을 로봇에 전달합니다.'
+        : '한 대씩 통과합니다. 대기·출구는 차체 여유를 두고 배치하세요. 저장하면 새 맵 버전을 로봇에 전달합니다.')
       : '저장하면 새 맵 버전을 활성화하고 로봇에 전달합니다. 엘리베이터 구역은 위치 표시용입니다.';
     $('#addTrafficGate').disabled = busy;
     $('#trafficGateRows').querySelectorAll('input,select,button').forEach(control => { control.disabled = busy; });
@@ -131,7 +136,7 @@ window.zoneEditor = (() => {
     gates = structuredClone(zone?.gates || []);
     renderGates();
     field('name').value = station?.name || zone?.name || '';
-    field('type').value = pickup ? 'prohibit' : (zone?.type || 'prohibit');
+    field('type').value = pickup ? 'prohibit' : zone?.type === 'occupancy' && gates.length === 1 ? 'oneway' : (zone?.type || 'prohibit');
     $('#zoneTypeLabel').hidden = pickup;
     $('#pickupNodeFields').hidden = !pickup;
     $('#zoneDescription').textContent = pickup
@@ -261,7 +266,7 @@ window.zoneEditor = (() => {
   }
   function drawEditor() {
     if (!active || !view.image) return;
-    const color = pickup ? PICKUP_COLOR : field('type').value==='occupancy' ? '#59c8be' : field('type').value==='elevator' ? '#ab9aee' : '#f2848c';
+    const color = pickup ? PICKUP_COLOR : occupancy() ? '#59c8be' : field('type').value==='elevator' ? '#ab9aee' : '#f2848c';
     if (rect) {
       const pts=geometry.corners(rect).map(point), a=pts[0];
       ctx.save(); ctx.fillStyle=color+'45'; ctx.strokeStyle=color; ctx.lineWidth=2;
@@ -281,7 +286,7 @@ window.zoneEditor = (() => {
     if (pickup) {
       drawNode(node, color, '⇲ 픽업', step === 'node');
       drawNode(ret, RETURN_COLOR, '⇱ 반납', step === 'return');
-    } else if (field('type').value === 'occupancy') {
+    } else if (occupancy()) {
       gates.forEach((g,i) => {
         drawNode(g.wait, color, `대기 ${i+1}`, false);
         drawNode(g.exit, '#e2bd79', `출구 ${i+1}`, false);
@@ -358,7 +363,13 @@ window.zoneEditor = (() => {
   $('#addTrafficGate').onclick = () => {
     gates.push({gate_id:`gate-${Date.now()}-${Math.random().toString(16).slice(2)}`,wait:null,exit:null}); renderGates();
   };
-  field('type').addEventListener('change',()=>{ sync(); draw(); });
+  field('type').addEventListener('change',()=>{
+    if (oneway()) {   // 진입 방향을 하나로 맞춘다
+      if (!gates.length) gates.push({gate_id:`gate-${Date.now()}-${Math.random().toString(16).slice(2)}`,wait:null,exit:null});
+      gates.length = 1; renderGates();
+    }
+    sync(); draw();
+  });
   $('#pickupStepZone').onclick = () => setStep('zone');
   $('#pickupStepNode').onclick = () => setStep('node');
   $('#pickupStepReturn').onclick = () => setStep('return');
@@ -382,7 +393,8 @@ window.zoneEditor = (() => {
         url = `${mapURL()}/pickup-stations${zoneId ? '/' + enc(zoneId) : ''}`;
         done = '픽업스테이션을 저장했습니다.';
       } else {
-        data={base_version:baseVersion,name,type:field('type').value,...dimensions};
+        data={base_version:baseVersion,name,type:occupancy()?'occupancy':field('type').value,...dimensions};
+        if (oneway() && gates.length !== 1) throw new Error('일방통행 통로는 진입 방향이 하나여야 합니다.');
         if (data.type === 'occupancy') {
           if (!gates.length || gates.some(g => !g.wait || !g.exit)) throw new Error('방향별 대기 node와 출구 node를 선택하세요.');
           data.gates = gates;

@@ -14,6 +14,8 @@ state 페이로드 (JSON):
     door          CLOSED | OPENING | OPEN | CLOSING
     moving        bool
     held          bool                문 열림 유지 중 (RELEASE 전까지 안 닫힘)
+    mode          NORMAL | OUT_OF_SERVICE | FIRE   (선택, 없으면 NORMAL) 비정상이면 FMS 가 이 승강기를 계획에서 뺀다
+    fault         str | null          (선택) 장애 설명
 
 cmd 페이로드 (JSON):
     cmd_id  str
@@ -35,6 +37,11 @@ DOOR_OPENING = "OPENING"
 DOOR_OPEN = "OPEN"
 DOOR_CLOSING = "CLOSING"
 
+MODE_NORMAL = "NORMAL"
+MODE_OUT_OF_SERVICE = "OUT_OF_SERVICE"
+MODE_FIRE = "FIRE"
+MODES = (MODE_NORMAL, MODE_OUT_OF_SERVICE, MODE_FIRE)
+
 CMD_CALL = "CALL"
 CMD_GO = "GO"
 CMD_RELEASE = "RELEASE"
@@ -46,6 +53,11 @@ def topic_state(elevator_id: str) -> str:
 
 def topic_cmd(elevator_id: str) -> str:
     return f"{TOPIC_PREFIX}/{elevator_id}/cmd"
+
+
+def topic_sim_fault(elevator_id: str) -> str:
+    """시뮬 전용: 승강기 장애 주입 (프로토콜 밖). 페이로드 {mode: NORMAL|OUT_OF_SERVICE|FIRE, fault?}."""
+    return f"sim/v1/elevator/{elevator_id}/fault"
 
 
 def topic_sim_teleport(robot_id: str) -> str:

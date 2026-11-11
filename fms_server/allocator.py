@@ -23,6 +23,10 @@ class JobAllocator:
                 self.coordinator.allocate_pending()
             except Exception:
                 log.exception('게시판 배정 중 오류')
+            try:
+                self.coordinator.tick_safety()
+            except Exception:
+                log.exception('교착·정체 감지 중 오류')
             for name, tick in list(self.ticks):
                 try:
                     tick()
