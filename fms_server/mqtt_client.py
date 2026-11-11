@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import json
+import time
 from typing import Optional
 
 import paho.mqtt.client as mqtt
@@ -33,6 +34,7 @@ from common.schemas import (
     Connection,
     ConnectionState,
     InstantAction,
+    InstantActionType,
     Order,
     State,
     topic_instant,
@@ -111,6 +113,10 @@ class FmsMqttClient:
         log.info("order 발행 %s (order_id=%s update=%d rc=%s)",
                  topic, order.order_id, order.order_update_id, info.rc)
 
+    def send_instant(self, robot_id: str, action_type: InstantActionType,
+                     params: Optional[dict] = None) -> InstantAction:
+        return send_instant(self, robot_id, action_type, params)
+
     def publish_instant(self, action: InstantAction) -> None:
         topic = topic_instant(action.robot_id)
         payload = action.model_dump_json()
@@ -184,6 +190,28 @@ class FmsMqttClient:
 # =============================================================================
 # 헬퍼
 # =============================================================================
+
+_INSTANT_PREFIX = {
+    InstantActionType.CANCEL_ORDER: "CANCEL", InstantActionType.SET_MAP: "SETMAP",
+    InstantActionType.INIT_POSITION: "INITPOS", InstantActionType.PAUSE: "PAUSE",
+    InstantActionType.RESUME: "RESUME", InstantActionType.RESET_ERROR: "RESETERR",
+}
+
+
+def send_instant(mqtt_client, robot_id: str, action_type: InstantActionType,
+                 params: Optional[dict] = None) -> InstantAction:
+    """즉시 명령을 조립해 발행한다. InstantAction 조립은 여기 한 곳에서만 한다.
+
+    `mqtt_client` 는 `publish_instant` 만 있으면 된다 (테스트의 가짜 Mqtt 포함).
+    """
+    now = time.time()
+    action = InstantAction(
+        header_id=0, timestamp=now, robot_id=robot_id,
+        action_id=f"{_INSTANT_PREFIX.get(action_type, action_type.value)}-{int(now * 1000)}-{robot_id}",
+        action_type=action_type, params=dict(params or {}))
+    mqtt_client.publish_instant(action)
+    return action
+
 
 def _parse_topic(topic: str) -> tuple[Optional[str], Optional[str]]:
     """fms/v1/{robot_id}/{kind} -> (robot_id, kind). 아니면 (None, None)."""

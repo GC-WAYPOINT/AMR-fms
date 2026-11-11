@@ -27,7 +27,6 @@ from typing import Optional
 from common.schemas import (
     Action, ActionType, ActionStatus, Pose, LocalizationState,
     ErrorLevel,
-    InstantAction,
     InstantActionType,
     Order,
     OrderNode,
@@ -36,7 +35,7 @@ from common.schemas import (
 )
 from fms_server.fleet import Fleet, FleetEvent
 from fms_server.locations import LocationError, LocationNotFound
-from fms_server.mqtt_client import FmsMqttClient
+from fms_server.mqtt_client import FmsMqttClient, send_instant
 from fms_server.sites import SiteRegistry
 
 log = logging.getLogger("fms.task")
@@ -71,6 +70,23 @@ class JobStatus(str, Enum):
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_time(value, name: str = "시각") -> Optional[str]:
+    """ISO 8601 문자열(또는 None)을 검증해 UTC ISO 로 돌려준다. 시간대가 없으면 UTC 로 본다."""
+    if value is None or value == "":
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        raise JobError(f"{name} 은 ISO 8601 시각이어야 한다: {value!r}") from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _epoch(iso: Optional[str]) -> Optional[float]:
+    return datetime.fromisoformat(iso).timestamp() if iso else None
 
 
 def _check_seg(value: str, kind: str) -> None:
@@ -203,6 +219,16 @@ class Job:
     updated_at: str = field(default_factory=_now_iso)
     dispatched_at: Optional[str] = None
 
+    # 운영 기능 (없던 필드는 from_dict 기본값으로 읽는다)
+    priority: int = 0                    # 클수록 먼저 배정
+    not_before: Optional[str] = None     # 이 시각(ISO) 전에는 배정하지 않는다
+    deadline: Optional[str] = None       # 마감(ISO). 넘겨도 실패 처리하지 않고 이벤트만 남긴다
+    deadline_missed: bool = False
+    robot_group: Optional[str] = None    # 이 그룹 로봇에만 배정
+    system: Optional[str] = None         # 시스템 작업: "charge" | "staging" | "evacuation" | "recover"
+    retry_of: Optional[str] = None       # 재시도 원본 job_id
+    external_id: Optional[str] = None    # 외부 주문 멱등 키
+
     def touch(self) -> None:
         self.updated_at = _now_iso()
 
@@ -225,6 +251,9 @@ class Job:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "dispatched_at": self.dispatched_at,
+            "priority": self.priority, "not_before": self.not_before, "deadline": self.deadline,
+            "deadline_missed": self.deadline_missed, "robot_group": self.robot_group,
+            "system": self.system, "retry_of": self.retry_of, "external_id": self.external_id,
         }
 
     @classmethod
@@ -248,6 +277,10 @@ class Job:
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
             dispatched_at=data.get("dispatched_at"),
+            priority=int(data.get("priority", 0)), not_before=data.get("not_before"),
+            deadline=data.get("deadline"), deadline_missed=bool(data.get("deadline_missed", False)),
+            robot_group=data.get("robot_group"), system=data.get("system"),
+            retry_of=data.get("retry_of"), external_id=data.get("external_id"),
         )
 
 
@@ -310,7 +343,9 @@ class JobStore:
 
     def create(
         self, site_id: str, commands: list[dict], robot_id: Optional[str] = None,
-        *, auto_assign=False, preset_name=None, resolved_steps=None, external_owner=None
+        *, auto_assign=False, preset_name=None, resolved_steps=None, external_owner=None,
+        priority: int = 0, not_before=None, deadline=None, robot_group=None, system=None,
+        retry_of=None, external_id=None,
     ) -> Job:
         _check_seg(site_id, "site_id")
         if not commands:
@@ -318,6 +353,7 @@ class JobStore:
         parsed = [_parse_command(e) for e in commands]
         if robot_id is not None:
             _check_seg(robot_id, "robot_id")
+        not_before, deadline = parse_time(not_before, "not_before"), parse_time(deadline, "deadline")
         with self._lock:
             n = self._seq.get(site_id, 0) + 1
             self._seq[site_id] = n
@@ -325,11 +361,19 @@ class JobStore:
             job = Job(job_id=job_id, site_id=site_id, commands=parsed, robot_id=robot_id,
                       auto_assign=auto_assign, preset_name=preset_name,
                       external_owner=external_owner,
-                      resolved_steps=copy.deepcopy(resolved_steps or []))
+                      resolved_steps=copy.deepcopy(resolved_steps or []),
+                      priority=int(priority), not_before=not_before, deadline=deadline,
+                      robot_group=robot_group or None, system=system, retry_of=retry_of,
+                      external_id=external_id)
             self._jobs[job_id] = job
             self._persist_site(site_id)
         log.info("job 생성: %s (명령 %d개, 로봇 %s)", job_id, len(parsed), robot_id or "-")
         return job
+
+    def by_external_id(self, site_id: str, external_id: str) -> Optional[Job]:
+        with self._lock:
+            return next((j for j in self._jobs.values()
+                         if j.site_id == site_id and j.external_id == external_id), None)
 
     def get(self, job_id: str) -> Job:
         with self._lock:
@@ -460,6 +504,7 @@ class JobCoordinator:
         self._ctl = elevator_ctl
         self._site_coordinator = site_coordinator
         self._events = events
+        self.battery = None      # BatteryManager: 충전 정책(min_job_charge)·비켜주기. 없으면 이전 동작
         self._unsubscribe = None
         self._lock = threading.RLock()
         self._reservations: dict[str, str] = {}
@@ -551,6 +596,11 @@ class JobCoordinator:
             raise JobError(f"로봇 {target_robot} 의 state 를 아직 못 받았다")
         if record.state.battery.charge <= 0:
             raise JobError("배터리가 소진된 로봇에는 작업을 배정할 수 없다")
+        policy = self._policy(job.site_id)
+        if (policy and policy["enabled"] and job.system != "charge" and not job.external_owner
+                and record.state.battery.charge < policy["min_job_charge"]):
+            raise JobError(f"배터리 {record.state.battery.charge:.0f}% — 작업 수락 기준 "
+                           f"{policy['min_job_charge']}% 미만 (충전 대기)")
         if not record.available_for_job(self._fleet.stale_after):
             raise JobError(
                 f"로봇 {target_robot} 가 작업 수락 불가 상태다 ({record.state.display_state})"
@@ -559,6 +609,9 @@ class JobCoordinator:
         assignment = self._registry.assignment_for(target_robot)
         if assignment is None or assignment.site_id != job.site_id:
             raise JobError(f"로봇 {target_robot} 가 site {job.site_id} 에 등록돼 있지 않다")
+        # 점검 중인 로봇은 새 작업을 받지 않는다. 이미 진행 중인 배송의 하위 작업은 끝까지 간다.
+        if not assignment.in_service and not job.external_owner:
+            raise JobError(f"로봇 {target_robot} 는 점검 중이다 (서비스 제외)")
 
         # 맵 버전 게이팅 — 오래된 금지구역 들고 도는 로봇에 job 안 준다
         try:
@@ -788,6 +841,13 @@ class JobCoordinator:
                 sd["t0"] = now
                 self._store.save(job)
                 return False
+            if ctl.lease_owner(eid) != job.job_id and self._registry.get_site(job.site_id).evacuating:
+                msg = "대피 중 — 승강기 신규 임대 금지"
+                if job.error != msg:
+                    job.error = msg
+                    self._store.save(job)
+                sd["t0"] = now
+                return False
             if not ctl.acquire(eid, job.job_id):
                 msg = f"승강기 {eid} 를 다른 작업({ctl.lease_owner(eid)})이 쓰는 중"
                 if job.error != msg:
@@ -872,10 +932,7 @@ class JobCoordinator:
             if "hint_at" not in sd:
                 if now - sd["tp_at"] < 0.6:
                     return False
-                self._mqtt.publish_instant(InstantAction(
-                    header_id=0, timestamp=now, robot_id=job.robot_id,
-                    action_id=f"INITPOS-{int(now * 1000)}-{job.robot_id}",
-                    action_type=InstantActionType.INIT_POSITION, params=pose | {"map_id": uid}))
+                send_instant(self._mqtt, job.robot_id, InstantActionType.INIT_POSITION, pose | {"map_id": uid})
                 sd["hint_at"] = now
                 sd["tries"] = sd.get("tries", 0) + 1
                 self._store.save(job)
@@ -945,15 +1002,7 @@ class JobCoordinator:
 
         dispatched = job.status in (JobStatus.ASSIGNED, JobStatus.WORKING)
         if dispatched and job.robot_id:
-            action = InstantAction(
-                header_id=0,
-                timestamp=time.time(),
-                robot_id=job.robot_id,
-                action_id=f"CANCEL-{int(time.time() * 1000)}-{job.robot_id}",
-                action_type=InstantActionType.CANCEL_ORDER,
-                params={},
-            )
-            self._mqtt.publish_instant(action)
+            send_instant(self._mqtt, job.robot_id, InstantActionType.CANCEL_ORDER)
 
         job.status = JobStatus.CANCELING if dispatched else JobStatus.CANCELED
         job.touch()
@@ -964,30 +1013,107 @@ class JobCoordinator:
             self._event("job.canceled", job, actor=actor)
         return job
 
+    def _policy(self, site_id: str) -> Optional[dict]:
+        return self.battery.policy(site_id) if self.battery is not None else None
+
     @_serialized
-    def allocate_pending(self):
-        """FIFO 게시판 + ID 순서 가용 로봇. 충돌 검사는 dispatch에서 다시 한다."""
+    def allocate_pending(self, now: Optional[float] = None):
+        """게시판 배정. 작업은 우선순위(높은 것 먼저) → 게시 순, 로봇은 비용(거리·배터리) 순.
+
+        전체 최적 할당은 하지 않는다 (우선순위 순 greedy). 충돌 검사는 dispatch에서 다시 한다.
+        """
         if not getattr(self._mqtt, "connected", True):
             return
         self.tick_traffic()
         self.tick_multifloor()
+        now = time.time() if now is None else now
+        from fms_server.assign import rank_candidates
         pending = sorted((j for j in self._store.list()
                           if j.status == JobStatus.PENDING and j.auto_assign),
-                         key=lambda j: (j.created_at, j.job_id))
+                         key=lambda j: (-j.priority, j.created_at, j.job_id))
         for job in pending:
+            deadline = _epoch(job.deadline)
+            if deadline is not None and now > deadline and not job.deadline_missed:
+                # 마감을 넘겨도 실패 처리하지 않는다. 이벤트·알림만 남긴다.
+                job.deadline_missed = True
+                self._store.save(job)
+                self._event("job.deadline_missed", job, "warning", deadline=job.deadline)
+            start = _epoch(job.not_before)
+            if start is not None and now < start:
+                reason = "예약 시각 전"
+                if job.error != reason:
+                    job.error = reason
+                    self._store.save(job)
+                continue
             reason = "같은 현장·맵의 가용 로봇을 기다리는 중"
-            for record in sorted(self._fleet.available_robots(), key=lambda r: r.robot_id):
+            try:
+                site = self._registry.get_site(job.site_id)
+            except Exception:
+                continue
+            blocked = site.allocation_blocked
+            if blocked:
+                if job.error != blocked:
+                    job.error = blocked
+                    self._store.save(job)
+                continue
+            records = []
+            for record in self._fleet.available_robots():
                 if job.robot_id and record.robot_id != job.robot_id:
                     continue
+                assignment = site.robots.get(record.robot_id)
+                if assignment is None:
+                    continue
+                if site.paused_for(assignment.map_id):
+                    reason = "현장 정지 중"
+                    continue
+                if record.robot_id in self._reservations:
+                    continue
+                records.append(record)
+            try:
+                order, why = rank_candidates(job, records, self._registry, self._elevators(),
+                                             self._policy(job.site_id))
+            except Exception:
+                log.exception("후보 순위 계산 실패 %s — 로봇 ID 순으로 대체", job.job_id)
+                order, why = sorted(r.robot_id for r in records), None
+            if why and not order:
+                reason = why
+            for robot_id in order:
                 try:
-                    self.dispatch(job.job_id, record.robot_id)
+                    self.dispatch(job.job_id, robot_id)
                     break
                 except JobError as exc:
                     reason = str(exc)
             else:
+                self._preempt_staging(job, site)
                 if job.error != reason:
                     job.error = reason
                     self._store.save(job)
+
+    def _preempt_staging(self, job: Job, site) -> None:
+        """일반 작업 후보가 없고 대기 위치로 가는 중인 로봇만 있으면 그 시스템 작업을 취소한다.
+
+        취소 확인(CANCELED) 뒤 다음 tick 에 이 작업이 배정된다. 한 번에 한 대만 선점한다.
+        """
+        if job.system:
+            return
+        staging = [j for j in self._store.list(job.site_id)
+                   if j.system == "staging" and j.status in (JobStatus.ASSIGNED, JobStatus.WORKING, JobStatus.CANCELING)]
+        if any(j.status == JobStatus.CANCELING for j in staging):
+            return   # 이미 선점 중 — 취소 확인을 기다린다
+        for candidate in sorted(staging, key=lambda j: j.job_id):
+            assignment = site.robots.get(candidate.robot_id)
+            if assignment is None or not assignment.in_service:
+                continue
+            if job.robot_id and job.robot_id != candidate.robot_id:
+                continue
+            if job.robot_group and job.robot_group not in assignment.groups:
+                continue
+            try:
+                self.cancel(candidate.job_id, actor="system", reason=f"선점: {job.job_id}")
+            except JobError:
+                continue
+            self._event("job.preempted", candidate, by=job.job_id)
+            return
 
     @_serialized
     def delete(self, job_id):

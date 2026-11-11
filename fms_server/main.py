@@ -49,6 +49,10 @@ from fms_server.task import JobCoordinator, JobStore
 from fms_server.locker import LockerBridge
 from fms_server.api.locker import router as locker_router
 from fms_server.api.events import router as events_router
+from fms_server.api.ops import router as ops_router
+from fms_server.api.charging import router as charging_router
+from fms_server.battery import BatteryManager
+from fms_server.scheduler import ScheduleStore, Scheduler
 from fms_server.events import EventLog
 from fms_server.robot_events import RobotEventRecorder
 
@@ -83,12 +87,19 @@ async def lifespan(app: FastAPI):
     elevator_sim = (BuiltinElevatorSim(settings, elevator_store, lambda: app.state.sites)
                     if settings.elevator_sim else None)
 
-    allocator = JobAllocator(job_coordinator, ticks=[("robot-events", robot_events.tick)])
+    presets = PresetStore(settings.data_root)
+    battery = BatteryManager(job_coordinator, registry, fleet, jobs, settings.data_root, events=events)
+    job_coordinator.battery = battery
+    schedules = ScheduleStore(settings.data_root)
+    scheduler = Scheduler(schedules, presets, registry, jobs, job_coordinator, events=events)
+    allocator = JobAllocator(job_coordinator, ticks=[
+        ("battery", battery.tick), ("scheduler", scheduler.tick), ("robot-events", robot_events.tick)])
+    app.state.battery, app.state.schedules, app.state.scheduler = battery, schedules, scheduler
     cargo = CargoStore(settings.data_root)
     app.state.cargo = cargo
     locker = LockerBridge(registry, fleet, jobs, job_coordinator, mqtt, settings.data_root, cargo=cargo, events=events)
     app.state.locker = locker
-    app.state.presets = PresetStore(settings.data_root)
+    app.state.presets = presets
     app.state.allocator = allocator
 
     app.state.settings = settings
@@ -149,6 +160,8 @@ app.include_router(cargo_router)
 app.include_router(elevators_router)
 app.include_router(locker_router)
 app.include_router(events_router)
+app.include_router(ops_router)
+app.include_router(charging_router)
 
 _ADMIN_HTML = Path(__file__).parent / "static" / "admin.html"
 app.mount("/static", StaticFiles(directory=_ADMIN_HTML.parent), name="static")

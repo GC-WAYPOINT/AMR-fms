@@ -15,6 +15,7 @@
 <script src="/static/elevator-status.js" defer></script>
 <script src="/static/jobs.js" defer></script>
 <script src="/static/events.js" defer></script>
+<script src="/static/ops.js" defer></script>
 </head>
 <body>
 <aside class="sidebar">
@@ -29,6 +30,7 @@
     <button data-page="maps"><span>▱</span>맵 관리</button>
     <button data-page="locations"><span>⌖</span>목적지·도킹</button>
     <button data-page="elevators"><span>⇅</span>엘리베이터</button>
+    <button data-page="ops"><span>⏻</span>운영 제어</button>
     <button data-page="events"><span>☰</span>이력</button>
     <button data-page="settings"><span>⚙</span>현장 설정</button>
   </nav>
@@ -40,6 +42,7 @@
     <div class="context"><label for="siteSelect">현장</label><select id="siteSelect" aria-label="현장 선택"></select><span class="slash">/</span><label for="mapSelect">맵</label><select id="mapSelect" aria-label="맵 선택"></select></div>
     <button id="refresh" class="quiet" title="현재 데이터 새로고침" aria-label="새로고침">↻</button>
   </header>
+  <div id="opsBanner" class="ops-banner" role="alert" hidden></div>
   <section id="page-map" class="page map-page">
     <div id="mapStage" tabindex="0" aria-label="실시간 맵. 드래그로 이동, 휠로 확대. 더하기·빼기 키로 확대·축소, 0 키로 전체 맞춤.">
       <canvas id="mapCanvas" aria-label="로봇, 구역, 목적지가 표시되는 현장 맵"></canvas>
@@ -137,9 +140,14 @@
     <div class="panel"><h3>프리셋에서 작업 생성</h3><form id="publishForm">
       <label>작업 프리셋<select id="publishPreset" required></select></label>
       <label>배정 방식<select id="publishMode"><option value="board">게시판 등록 · 자동 배정</option><option value="direct">로봇 지정 · 즉시 실행</option></select></label>
-      <label id="publishRobotLabel" hidden>로봇<select id="publishRobot"></select></label><button class="primary">작업 생성</button>
+      <label id="publishRobotLabel" hidden>로봇<select id="publishRobot"></select></label>
+      <label>우선순위<input id="publishPriority" type="number" min="-100" max="100" value="0" title="클수록 먼저 배정"></label>
+      <label>로봇 그룹<input id="publishGroup" placeholder="비우면 모든 로봇"></label>
+      <label>시작 시각<input id="publishNotBefore" type="datetime-local" title="이 시각 전에는 배정하지 않습니다"></label>
+      <label>마감<input id="publishDeadline" type="datetime-local" title="넘기면 알림만 남깁니다"></label>
+      <button class="primary">작업 생성</button>
     </form><p id="publishPreview" class="muted">프리셋을 먼저 등록하세요.</p></div>
-    <div class="job-filters" role="group" aria-label="작업 상태 필터"><button data-job-filter="pending" class="active">게시판</button><button data-job-filter="active">배정·실행 중</button><button data-job-filter="history">작업 이력</button></div>
+    <div class="job-filters" role="group" aria-label="작업 상태 필터"><button data-job-filter="pending" class="active">게시판</button><button data-job-filter="active">배정·실행 중</button><button data-job-filter="history">작업 이력</button><label class="check"><input type="checkbox" id="showSystemJobs"> 시스템 작업 표시</label></div>
     <details class="panel"><summary>프리셋 없이 이동 작업 만들기</summary>
     <div class="panel"><h3>작업 만들기</h3><form id="jobForm"><label>로봇<select name="robot_id" id="jobRobot"></select></label><label>목적지<select name="target" id="jobTarget"></select></label><button type="button" id="addStep">경유지 추가</button><button class="primary">작업 생성</button></form><div id="jobSteps" class="muted">선택한 목적지로 이동합니다.</div></div>
     </details>
@@ -164,6 +172,18 @@
       <div class="preset-actions"><button id="savePreset" class="primary">프리셋 저장</button><button id="resetPreset">새로 만들기</button></div>
     </div>
     <div class="table-wrap"><table><thead><tr><th>프리셋</th><th>단계</th><th>수정 시각</th><th></th></tr></thead><tbody id="presetRows"></tbody></table></div>
+    <div class="panel"><h3>예약 실행</h3><form id="scheduleForm">
+      <label>예약 이름<input name="name" maxlength="128" placeholder="아침 순회"></label>
+      <label>프리셋<select name="preset_id" required></select></label>
+      <label>방식<select name="kind"><option value="time">요일·시각</option><option value="interval">간격 반복</option></select></label>
+      <label id="scheduleTimeLabel">시각 (서버 시간)<input name="time" type="time" value="09:00"></label>
+      <label id="scheduleIntervalLabel" hidden>간격 (분)<input name="interval" type="number" min="1" step="any" value="60"></label>
+      <fieldset class="schedule-days"><legend>요일 (선택 없으면 매일)</legend><div id="scheduleDays"></div></fieldset>
+      <label>우선순위<input name="priority" type="number" min="-100" max="100" value="0"></label>
+      <label>로봇 그룹<input name="robot_group" placeholder="비우면 모든 로봇"></label>
+      <button class="primary">예약 등록</button>
+    </form><p class="muted">때가 되면 프리셋을 게시판에 올립니다. 서버가 꺼져 있던 동안 놓친 실행은 건너뜁니다.</p></div>
+    <div class="table-wrap"><table><thead><tr><th>예약</th><th>프리셋</th><th>실행 시점</th><th>우선순위</th><th>그룹</th><th>상태</th><th>마지막 실행</th><th></th></tr></thead><tbody id="scheduleRows"></tbody></table></div>
   </section>
   <section id="page-maps" class="page content-page" hidden>
     <div class="page-heading"><div><h2>맵 관리</h2><p>맵을 업로드하고 현장에서 사용할 버전을 활성화합니다.</p></div></div>
@@ -184,6 +204,33 @@
       <div class="table-wrap"><table><thead><tr><th>승강기</th><th>현재 층</th><th>동작 상태</th><th>목표 층</th><th>문 상태</th><th>수신 상태</th></tr></thead><tbody id="elevatorStatusRows"><tr><td colspan="6" class="empty-row">운행 상태를 확인합니다.</td></tr></tbody></table></div>
     </section>
     <div id="elevatorBody"></div>
+  </section>
+  <section id="page-ops" class="page content-page" hidden>
+    <div class="page-heading"><div><h2>운영 제어</h2><p>현장 정지·대피와 자동 충전·대기 위치 정책을 관리합니다. 정지·대피는 교통 예약과 승강기 임대를 풀지 않습니다.</p></div></div>
+    <div class="panel"><h3>현장 정지·대피</h3>
+      <p id="opsState" role="status">확인 중</p>
+      <div class="ops-controls">
+        <label>사유<input id="opsReason" maxlength="500" placeholder="청소, 화재 경보 등"></label>
+        <label>정지 범위<select id="pauseScope"><option value="site">현장 전체</option><option value="map">선택한 맵만</option></select></label>
+        <button id="sitePause" type="button">현장 정지</button><button id="siteResume" type="button">현장 재개</button>
+        <label>대피 방식<select id="evacMode"><option value="pause">제자리 정지</option><option value="pullover">작업 취소 후 대기 위치로 이동</option></select></label>
+        <button id="evacStart" type="button" class="danger">대피 시작</button><button id="evacEnd" type="button">대피 해제</button>
+      </div>
+      <div id="evacCanceled"></div>
+    </div>
+    <div class="panel"><h3>자동 충전·대기 위치</h3><form id="chargingForm">
+      <label class="check"><input type="checkbox" name="enabled"> 자동 충전 사용</label>
+      <label>충전 시작 (%)<input name="low" type="number" min="0" max="100" required></label>
+      <label>위험 알림 (%)<input name="critical" type="number" min="0" max="100" required></label>
+      <label>충전 완료 기준 (%)<input name="release" type="number" min="0" max="100" required></label>
+      <label>작업 수락 최소 (%)<input name="min_job_charge" type="number" min="0" max="100" required></label>
+      <label class="check"><input type="checkbox" name="opportunity"> 유휴 시간에 미리 충전</label>
+      <label>미리 충전 유휴 시간 (초)<input name="idle_after" type="number" min="0" required></label>
+      <label class="check"><input type="checkbox" name="stagingEnabled"> 유휴 로봇을 주차 지점으로 복귀</label>
+      <label>복귀 유휴 시간 (초)<input name="stagingIdle" type="number" min="0" required></label>
+      <button class="primary">정책 저장</button>
+    </form><p class="muted">충전소는 목적지 용도 '충전소'(맵 충전기와 일치), 대기 위치는 '주차 지점'입니다. 대기 위치로 가는 중인 로봇은 새 작업이 오면 되돌립니다.</p></div>
+    <div class="table-wrap"><table><thead><tr><th>이름</th><th>종류</th><th>맵</th><th>상태</th><th>진입</th><th>사용 그룹</th></tr></thead><tbody id="spotRows"></tbody></table></div>
   </section>
   <section id="page-events" class="page content-page" hidden>
     <div class="page-heading"><div><h2>이력</h2><p>작업·로봇·교통·승강기·운영 조작의 이벤트 로그입니다. 보존 기간이 지나면 지워집니다.</p></div></div>

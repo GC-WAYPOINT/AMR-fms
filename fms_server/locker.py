@@ -20,6 +20,7 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from fms_server import charger_pool
 from fms_server.cargo import TRAYS, CargoError, CargoStore, parse_tray_return, tray_return_payload
 from fms_server.delivery_progress import delivery_progress
 from fms_server.task import JobError, JobStatus, resolve_steps, _parse_command
@@ -439,6 +440,9 @@ class LockerBridge:
                 a = self.registry.assignment_for(record.robot_id)
                 if not a or a.site_id != config["site_id"]:
                     continue
+                site = self.registry.get_site(a.site_id)
+                if not a.in_service or site.allocation_blocked or site.paused_for(a.map_id):
+                    continue  # 점검 로봇·정지/대피 중인 현장에는 새 배송을 시작하지 않는다
                 if any(t["state"] != "none" for t in self.cargo.robot_cargo(record.robot_id)["trays"]):
                     continue  # 트레이를 반납하지 않은 로봇은 새 묶음을 받지 않는다
                 try:
@@ -555,63 +559,20 @@ class LockerBridge:
         self._save()
         self.coordinator.release_robot(d["robot_id"], d["job_id"])
 
-    DOCK_UNDOCK_DISTANCE = 0.6   # 충전기 진입 직선 거리 (m). 로봇은 이만큼 떨어진 진입 지점까지 경로계획으로 간다
+    DOCK_UNDOCK_DISTANCE = charger_pool.DOCK_UNDOCK_DISTANCE
 
+    # 충전소 선택은 charger_pool 이 한다 (자동 충전과 같은 규칙). 여기는 배송 쪽 예약만 더한다.
     def _chargers(self, site_id):
-        """도킹 가능한 충전소: type=charger 목적지 중 맵 chargers.json 의 물리 충전기와 위치·방향이 맞는 것.
-
-        approach_free: 진입 지점(FORWARD 면 충전기 뒤쪽, BACKWARD 면 앞쪽 DOCK_UNDOCK_DISTANCE)이 주행 가능한 셀인지.
-        막혀 있으면 로봇이 NO_PATH 로 실패하므로 고르지 않는다 (보통 진입 방향 설정이 반대인 경우).
-        """
-        import json as _json
-        from fms_server.mapkit.chargers import read_chargers
-        maps, locations = self.registry.map_store(site_id), self.registry.location_store(site_id)
-        physical, models = {}, {}
-        out = []
-        for loc in locations.list():
-            if loc.type != "charger":
-                continue
-            if loc.map_id not in physical:
-                try:
-                    physical[loc.map_id] = read_chargers(_json.loads(maps.file_path(loc.map_id, "chargers.json").read_text()))
-                except Exception:
-                    physical[loc.map_id] = []
-            for c in physical[loc.map_id]:
-                delta = math.atan2(math.sin(c.theta - loc.theta), math.cos(c.theta - loc.theta))
-                if math.hypot(c.x - loc.x, c.y - loc.y) <= .3 and abs(delta) <= .35:
-                    entry = c.entry or "FORWARD"
-                    sign = -1.0 if entry == "FORWARD" else 1.0
-                    ax = loc.x + sign * self.DOCK_UNDOCK_DISTANCE * math.cos(loc.theta)
-                    ay = loc.y + sign * self.DOCK_UNDOCK_DISTANCE * math.sin(loc.theta)
-                    try:
-                        if loc.map_id not in models:
-                            models[loc.map_id] = maps.load_map_model(loc.map_id)
-                        free = models[loc.map_id].in_bounds(ax, ay) and models[loc.map_id].is_free(ax, ay)
-                    except Exception:
-                        free = False
-                    out.append({"name": loc.name, "map_id": loc.map_id, "x": loc.x, "y": loc.y,
-                                "entry": entry, "approach_free": free})
-                    break
-        return out
+        return charger_pool.chargers(self.registry, site_id)
 
     def _busy_chargers(self, d):
-        """다른 작업·배송이 향하거나 다른 로봇이 서 있는 충전소 이름."""
+        """다른 작업·배송이 향하는 충전소 이름."""
         busy = {o.get("charger") for o in self.deliveries.values()
                 if o is not d and o["phase"] == "docking" and o.get("charger")}
-        for job in self.jobs.list(d["config"]["site_id"]):
-            if job.robot_id != d["robot_id"] and not job.status.terminal:
-                busy.update(c.target for c in job.commands if getattr(c, "kind", None) == "docking")
-        return busy
+        return busy | charger_pool.targeted(self.jobs, d["config"]["site_id"], d["robot_id"])
 
     def _occupied(self, charger, robot_id):
-        for record in self.fleet.all():
-            a = self.registry.assignment_for(record.robot_id)
-            if record.robot_id == robot_id or record.state is None or not a or a.map_id != charger["map_id"]:
-                continue
-            pose = record.state.pose
-            if math.hypot(pose.x - charger["x"], pose.y - charger["y"]) < 0.5:
-                return True
-        return False
+        return charger_pool.occupied(self.fleet, self.registry, charger, robot_id)
 
     def _choose_charger(self, d):
         mode = d["config"].get("charger_target", "auto")
@@ -629,16 +590,18 @@ class LockerBridge:
                 return None, blocked_note
             return chosen[0], None
         busy = self._busy_chargers(d)
+        assignment = self.registry.assignment_for(d["robot_id"])
+        groups = assignment.groups if assignment else []
         free = [c for c in chargers if c["approach_free"] and c["name"] not in busy
-                and not self._occupied(c, d["robot_id"])]
+                and charger_pool.group_ok(c, groups) and not self._occupied(c, d["robot_id"])]
         if not free:
             if not chargers:
                 return None, "등록된 충전 스테이션 없음"
             return None, blocked_note if len(blocked) == len(chargers) else "빈 충전 스테이션 없음"
         origin = d.get("return_step") or d.get("pickup")
         ox, oy = origin["pose"]["x"], origin["pose"]["y"]
-        # 반납 지점과 같은 층을 먼저, 그 안에서는 직선거리 순.
-        free.sort(key=lambda c: (c["map_id"] != origin["map_id"], math.hypot(c["x"] - ox, c["y"] - oy), c["name"]))
+        # 반납 지점과 같은 층을 먼저, 그 안에서는 주행 거리 순 (계산할 수 없으면 직선거리).
+        free = charger_pool.sort_by_distance(self.registry, d["config"]["site_id"], free, origin["map_id"], (ox, oy))
         return free[0], None
 
     def _dock(self, d):

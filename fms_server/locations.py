@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -71,6 +71,7 @@ class NamedLocation:
     created_at: str = ""
     updated_at: str = ""
     zone_id: Optional[str] = None  # type == pickup/tray_return 일 때만. 연결된 pickup zone (불변 스테이션 ID)
+    groups: list = field(default_factory=list)  # 충전소·대기 위치를 쓸 수 있는 로봇 그룹 (비면 누구나)
 
     @property
     def pose(self) -> Pose:
@@ -89,6 +90,8 @@ class NamedLocation:
         }
         if self.zone_id is not None:
             data["zone_id"] = self.zone_id
+        if self.groups:
+            data["groups"] = list(self.groups)
         return data
 
     @classmethod
@@ -103,6 +106,7 @@ class NamedLocation:
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
             zone_id=data.get("zone_id"),
+            groups=list(data.get("groups") or []),
         )
 
 
@@ -243,7 +247,12 @@ class LocationStore:
         y: Optional[float] = None,
         theta: Optional[float] = None,
         type: Optional[str] = None,
+        groups: Optional[list] = None,
     ) -> tuple[NamedLocation, list[str]]:
+        if groups is not None:
+            if any(not isinstance(g, str) or not g.strip() or len(g) > 64 for g in groups):
+                raise LocationError("그룹 이름은 1~64자 문자열이어야 한다")
+            groups = list(dict.fromkeys(g.strip() for g in groups))
         with self._lock:
             locs = self._load()
             loc = locs.get(name)
@@ -266,7 +275,7 @@ class LocationStore:
             loc = NamedLocation(
                 name=target_name, map_id=new_map, x=pose.x, y=pose.y, theta=pose.theta,
                 type=new_type, created_at=loc.created_at, updated_at=_now_iso(),
-                zone_id=loc.zone_id,
+                zone_id=loc.zone_id, groups=groups if groups is not None else list(loc.groups),
             )
             del locs[name]
             locs[target_name] = loc

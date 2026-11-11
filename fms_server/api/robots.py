@@ -3,6 +3,9 @@
     GET  /api/v1/robots            전체 목록 + 요약
     GET  /api/v1/robots/{id}       한 대 상세
     POST /api/v1/robots/{id}/init-position   위치 힌트 (INIT_POSITION 즉시명령 발행)
+    POST /api/v1/robots/{id}/pause           원격 일시정지 (PAUSE)
+    POST /api/v1/robots/{id}/resume          재개 (RESUME). FMS 가 건 일시정지만 풀 수 있다 (아니면 409)
+    POST /api/v1/robots/{id}/reset-error     오류 해제 (RESET_ERROR)
     WS   /api/v1/robots/stream     스냅샷 1회 + 이후 변경 이벤트 스트림
 
 오더 발행은 job API(api/jobs.py)가 한다.
@@ -11,13 +14,13 @@
 from __future__ import annotations
 
 import logging
-import time
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from common.schemas import InstantAction, InstantActionType
+from common.schemas import InstantActionType, PauseSource
+from fms_server.mqtt_client import send_instant
 
 from fms_server.api.views import FleetView, RobotView, build_robot_view
 
@@ -59,17 +62,63 @@ def init_position(robot_id: str, body: InitPositionRequest, request: Request):
     params: dict[str, float | str | bool] = {"x": body.x, "y": body.y, "theta": body.theta}
     if record.state.map_id:
         params["map_id"] = record.state.map_id
-    action = InstantAction(
-        header_id=0,
-        timestamp=time.time(),
-        robot_id=robot_id,
-        action_id=f"INITPOS-{int(time.time() * 1000)}-{robot_id}",
-        action_type=InstantActionType.INIT_POSITION,
-        params=params,
-    )
-    request.app.state.mqtt.publish_instant(action)
+    send_instant(request.app.state.mqtt, robot_id, InstantActionType.INIT_POSITION, params)
     log.info("위치 힌트 -> %s (%.2f, %.2f, %.2f)", robot_id, body.x, body.y, body.theta)
     return {"robot_id": robot_id, "sent": True, "params": params}
+
+
+def _command(request: Request, robot_id: str, action_type: InstantActionType, check=None):
+    record = request.app.state.fleet.get(robot_id)
+    if record is None or record.state is None:
+        return JSONResponse(status_code=404, content={"detail": f"로봇 {robot_id} 의 state 를 아직 못 받았다"})
+    if check is not None:
+        problem = check(record.state)
+        if problem:
+            return JSONResponse(status_code=409, content={"detail": problem})
+    send_instant(request.app.state.mqtt, robot_id, action_type)
+    from fms_server.api.events import record as record_event
+    assignment = request.app.state.sites.assignment_for(robot_id)
+    record_event(request, "robot.command", robot_id=robot_id, command=action_type.value,
+                 site_id=assignment.site_id if assignment else None)
+    log.info("%s -> %s", action_type.value, robot_id)
+    return {"robot_id": robot_id, "sent": True, "action": action_type.value}
+
+
+def _site_hold(request: Request, robot_id: str):
+    """이 로봇이 현장 정지·대피(pause) 범위에 있으면 그 이유."""
+    registry = request.app.state.sites
+    assignment = registry.assignment_for(robot_id)
+    if assignment is None:
+        return None
+    site = registry.get_site(assignment.site_id)
+    if site.paused_for(assignment.map_id):
+        return "대피 중" if site.evacuating else "현장 정지 중"
+    return None
+
+
+@router.post("/robots/{robot_id}/pause")
+def pause_robot(robot_id: str, request: Request):
+    return _command(request, robot_id, InstantActionType.PAUSE)
+
+
+@router.post("/robots/{robot_id}/resume")
+def resume_robot(robot_id: str, request: Request):
+    hold = _site_hold(request, robot_id)
+
+    def check(state):
+        if not state.paused:
+            return "로봇이 일시정지 상태가 아니다"
+        if state.pause_source != PauseSource.FMS:
+            return "로봇에서 건 일시정지(LOCAL)는 FMS 가 풀 수 없다 — 로봇에서 해제해라"
+        if hold:
+            return f"{hold} — 현장 재개(또는 대피 해제) 후에 풀린다"
+        return None
+    return _command(request, robot_id, InstantActionType.RESUME, check)
+
+
+@router.post("/robots/{robot_id}/reset-error")
+def reset_error(robot_id: str, request: Request):
+    return _command(request, robot_id, InstantActionType.RESET_ERROR)
 
 
 @router.websocket("/robots/stream")

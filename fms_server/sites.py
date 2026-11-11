@@ -6,7 +6,8 @@ Site 레지스트리
 구역별)와 로봇이 귀속된다. 로봇은 등록 시 맵 하나를 배정받는다.
 
     {data_root}/sites/{site_id}/
-      site.json              {name, created_at, robots:{id:{map_id, registered_at}}}
+      site.json              {name, created_at, robots:{id:{map_id, registered_at, in_service, note, groups}},
+                              ops:{paused, reason, since, map_ids, robots, evacuation}}
       maps/{map_id}/{version}/...      (MapStore 가 관리)
       maps/{map_id}/active
 
@@ -61,10 +62,26 @@ class RobotAssignment:
     site_id: str
     map_id: str
     registered_at: str = field(default_factory=_now_iso)
+    in_service: bool = True          # False = 점검(서비스 제외). 새 작업을 배정하지 않는다
+    note: str = ""                   # 점검 사유 등 운영 메모
+    groups: list[str] = field(default_factory=list)   # 로봇 그룹 (작업·충전소·대기 위치 필터)
 
     def to_dict(self) -> dict:
         # site_id 는 site.json 의 위치로 이미 알 수 있으므로 저장하지 않는다.
-        return {"map_id": self.map_id, "registered_at": self.registered_at}
+        data = {"map_id": self.map_id, "registered_at": self.registered_at}
+        if not self.in_service:
+            data["in_service"] = False
+        if self.note:
+            data["note"] = self.note
+        if self.groups:
+            data["groups"] = list(self.groups)
+        return data
+
+
+def default_ops() -> dict:
+    """현장 운영 상태. 정지·대피는 재시작해도 유지돼야 하므로 site.json 에 둔다."""
+    return {"paused": False, "reason": "", "since": None, "map_ids": None, "robots": [],
+            "evacuation": {"active": False, "reason": "", "mode": "pause", "since": None, "canceled_jobs": []}}
 
 
 @dataclass
@@ -74,14 +91,43 @@ class Site:
     created_at: str = field(default_factory=_now_iso)
     # robot_id -> RobotAssignment
     robots: dict[str, RobotAssignment] = field(default_factory=dict)
+    ops: dict = field(default_factory=default_ops)
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "site_id": self.site_id,
             "name": self.name,
             "created_at": self.created_at,
             "robots": {rid: a.to_dict() for rid, a in self.robots.items()},
         }
+        if self.ops != default_ops():
+            data["ops"] = self.ops
+        return data
+
+    # -- 운영 상태 조회 (정지·대피) ------------------------------------
+
+    def paused_for(self, map_id: Optional[str] = None) -> bool:
+        """이 맵(또는 현장 전체)이 정지 중인가. 대피 pause 모드도 정지로 본다."""
+        evacuation = self.ops["evacuation"]
+        if evacuation["active"] and evacuation["mode"] == "pause":
+            return True
+        if not self.ops["paused"]:
+            return False
+        scope = self.ops.get("map_ids")
+        return not scope or map_id is None or map_id in scope
+
+    @property
+    def evacuating(self) -> bool:
+        return bool(self.ops["evacuation"]["active"])
+
+    @property
+    def allocation_blocked(self) -> Optional[str]:
+        """현장 전체 배정을 막는 이유 (없으면 None). 맵 범위 정지는 로봇별로 본다."""
+        if self.evacuating:
+            return "대피 중"
+        if self.ops["paused"] and not self.ops.get("map_ids"):
+            return "현장 정지 중"
+        return None
 
     @classmethod
     def from_dict(cls, site_id: str, data: dict) -> "Site":
@@ -91,6 +137,9 @@ class Site:
                 site_id=site_id,
                 map_id=entry["map_id"],
                 registered_at=entry.get("registered_at", ""),
+                in_service=entry.get("in_service", True),
+                note=entry.get("note", ""),
+                groups=list(entry.get("groups") or []),
             )
             for rid, entry in (data.get("robots") or {}).items()
         }
@@ -99,7 +148,18 @@ class Site:
             name=data.get("name", site_id),
             created_at=data.get("created_at", ""),
             robots=robots,
+            ops=_merge_ops(data.get("ops")),
         )
+
+
+def _merge_ops(stored) -> dict:
+    ops = default_ops()
+    if isinstance(stored, dict):
+        evacuation = stored.get("evacuation")
+        ops.update({k: v for k, v in stored.items() if k in ops and k != "evacuation"})
+        if isinstance(evacuation, dict):
+            ops["evacuation"].update({k: v for k, v in evacuation.items() if k in ops["evacuation"]})
+    return ops
 
 
 class SiteRegistry:
@@ -195,7 +255,7 @@ class SiteRegistry:
     # -- 로봇 등록 / 배정 --------------------------------------
 
     def register_robot(self, site_id: str, robot_id: str, map_id: str) -> RobotAssignment:
-        """로봇을 site 에 등록하고 맵을 배정한다. 이미 있으면 재배정."""
+        """로봇을 site 에 등록하고 맵을 배정한다. 이미 있으면 재배정 (점검·메모·그룹은 유지)."""
         _check_id(robot_id, "robot_id")
         _check_id(map_id, "map_id")
         with self._lock:
@@ -207,11 +267,50 @@ class SiteRegistry:
             except Exception:
                 raise SiteError(f"site {site_id} 에 맵 {map_id} 가 없다 — 먼저 업로드해라") from None
 
+            previous = site.robots.get(robot_id)
             assignment = RobotAssignment(robot_id=robot_id, site_id=site_id, map_id=map_id)
+            if previous is not None:
+                assignment.registered_at = previous.registered_at
+                assignment.in_service, assignment.note = previous.in_service, previous.note
+                assignment.groups = list(previous.groups)
             site.robots[robot_id] = assignment
             self._persist(site)
             log.info("로봇 등록: %s -> site %s / 맵 %s", robot_id, site_id, map_id)
             return assignment
+
+    def update_robot(self, site_id: str, robot_id: str, *, in_service: Optional[bool] = None,
+                     note: Optional[str] = None, groups: Optional[list[str]] = None) -> RobotAssignment:
+        """점검 모드·메모·그룹을 바꾼다 (None 은 그대로 둔다)."""
+        with self._lock:
+            site = self.get_site(site_id)
+            assignment = site.robots.get(robot_id)
+            if assignment is None:
+                raise SiteNotFound(f"로봇 {robot_id} 는 site {site_id} 에 등록돼 있지 않다")
+            if groups is not None:
+                cleaned = []
+                for group in groups:
+                    if not isinstance(group, str) or not group.strip() or len(group) > 64:
+                        raise SiteError("그룹 이름은 1~64자 문자열이어야 한다")
+                    if group.strip() not in cleaned:
+                        cleaned.append(group.strip())
+                assignment.groups = cleaned
+            if in_service is not None:
+                assignment.in_service = bool(in_service)
+            if note is not None:
+                if len(note) > 500:
+                    raise SiteError("메모는 500자 이하여야 한다")
+                assignment.note = note
+            self._persist(site)
+            return assignment
+
+    def update_ops(self, site_id: str, mutate) -> dict:
+        """`mutate(ops)` 로 현장 운영 상태를 바꾸고 저장한다. 바뀐 ops 의 복사본을 돌려준다."""
+        import copy
+        with self._lock:
+            site = self.get_site(site_id)
+            mutate(site.ops)
+            self._persist(site)
+            return copy.deepcopy(site.ops)
 
     def unregister_robot(self, site_id: str, robot_id: str) -> None:
         with self._lock:

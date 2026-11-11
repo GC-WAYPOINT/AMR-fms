@@ -47,6 +47,7 @@ class UpdateLocationRequest(BaseModel):
     y: float | None = None
     theta: float | None = None
     type: str | None = None
+    groups: list[str] | None = None   # 충전소·대기 위치를 쓸 로봇 그룹 (빈 목록 = 누구나)
 
 
 class LocationOut(BaseModel):
@@ -58,6 +59,7 @@ class LocationOut(BaseModel):
     theta: float
     type: str
     zone_id: str | None = None
+    groups: list[str] = []
     created_at: str
     updated_at: str
     warnings: list[str] = []
@@ -83,7 +85,7 @@ def _out(request: Request, site_id: str, loc: NamedLocation, warnings: list[str]
         map_uid = ""
     return LocationOut(
         name=loc.name, map_id=loc.map_id, map_uid=map_uid,
-        x=loc.x, y=loc.y, theta=loc.theta, type=loc.type, zone_id=loc.zone_id,
+        x=loc.x, y=loc.y, theta=loc.theta, type=loc.type, zone_id=loc.zone_id, groups=list(loc.groups),
         created_at=loc.created_at, updated_at=loc.updated_at,
         warnings=warnings or [],
     )
@@ -100,7 +102,7 @@ def _update_with_references(request, site_id, store, old_name, body):
     생성된 작업의 좌표/오더 스냅샷과 충전기 설비 ID는 변경하지 않는다.
     """
     fields = dict(new_name=body.name, map_id=body.map_id, x=body.x,
-                  y=body.y, theta=body.theta, type=body.type)
+                  y=body.y, theta=body.theta, type=body.type, groups=body.groups)
     current = store.get(old_name)
     if current.type in ("pickup", "tray_return") and any(
             new is not None and new != old for new, old in (

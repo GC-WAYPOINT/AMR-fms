@@ -91,7 +91,12 @@ window.jobUI = (()=>{
       const direct=$f('publishMode').value==='direct',robot=$f('publishRobot').value;
       if(direct&&!robot)throw new Error('실행할 로봇을 선택하세요.');
       saving=true;render();try{
-        await request(`${siteURL()}/presets/${enc(preset)}/publish`,'POST',direct?{robot_id:robot}:{});
+        const body=direct?{robot_id:robot}:{},iso=id=>$f(id).value?new Date($f(id).value).toISOString():null;
+        body.priority=Number($f('publishPriority').value)||0;
+        if($f('publishGroup').value.trim())body.robot_group=$f('publishGroup').value.trim();
+        if(iso('publishNotBefore'))body.not_before=iso('publishNotBefore');
+        if(iso('publishDeadline'))body.deadline=iso('publishDeadline');
+        await request(`${siteURL()}/presets/${enc(preset)}/publish`,'POST',body);
         filter=direct?'active':'pending';updateFilter();await refreshSite();notify(direct?'로봇에 작업을 배정했습니다.':'게시판에 등록했습니다. 가용 로봇을 기다립니다.');
       }finally{saving=false;render();}
     });
@@ -104,6 +109,7 @@ window.jobUI = (()=>{
   $f('resetPreset').onclick=()=>{if(canLeave())reset();};
   window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue='';}});
   typeChanged();renderSteps();render();
-  return {render,describe,canLeave,setPresets(data){presets=data;},resetSite(){presets=[];reset();},
+  $f('showSystemJobs').onchange=()=>renderJobs();
+  return {render,describe,canLeave,get presets(){return presets;},setPresets(data){presets=data;},resetSite(){presets=[];reset();},
     visible(j){return filter==='pending'?j.status==='pending':filter==='active'?['assigned','working','canceling'].includes(j.status):['success','failed','canceled'].includes(j.status);}};
 })();

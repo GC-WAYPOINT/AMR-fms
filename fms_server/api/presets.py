@@ -3,7 +3,8 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from fms_server.api.jobs import CommandIn, JobOut, _check_site
-from fms_server.task import Job, JobError, JobNotFound, _parse_command, resolve_steps, compile_to_order
+from fms_server.presets import publish
+from fms_server.task import JobError, JobNotFound
 
 router = APIRouter(prefix='/api/v1/sites/{site_id}/presets', tags=['presets'])
 
@@ -17,6 +18,10 @@ class PresetIn(BaseModel):
 class PublishIn(BaseModel):
     model_config = ConfigDict(extra='forbid')
     robot_id: str | None = None
+    priority: int = Field(default=0, ge=-100, le=100)   # 클수록 먼저 배정
+    robot_group: str | None = None                      # 이 그룹 로봇에만 배정
+    not_before: str | None = None                       # 이 시각(ISO) 전에는 배정하지 않는다
+    deadline: str | None = None                         # 마감(ISO). 넘기면 이벤트만 남긴다
 
 
 def _call(request,site,fn):
@@ -56,40 +61,11 @@ def delete_preset(site_id: str, preset_id: str, request: Request):
 
 @router.post('/{preset_id}/publish', response_model=JobOut)
 def publish_preset(site_id: str, preset_id: str, body: PublishIn, request: Request):
-    def publish(store):
-        preset = store.get(site_id,preset_id)
-        commands = [_parse_command(c) for c in preset['commands']]
-        resolved = resolve_steps(commands,site_id,request.app.state.sites)
-        # 충전기 연결과 맵 일치도 게시 전에 검사한다. 직접 실행은 dispatch에서 가용성도 검사한다.
-        robots = request.app.state.sites.get_site(site_id).robots
-        candidate = body.robot_id or next((r.robot_id for r in robots.values()
-                          if r.map_id == resolved[0]['map_id']), None)
-        start = request.app.state.sites.assignment_for(candidate) if candidate else None
-        if start and {r['map_id'] for r in resolved} != {start.map_id}:
-            # 여러 층: 승강기 연결·문 방향·충전기를 미리 확인한다
-            from fms_server.route import RouteError, build_plan
-            try:
-                build_plan(commands,resolved,start.map_id,site_id,request.app.state.job_coordinator._elevators(),
-                           registry=request.app.state.sites)
-            except RouteError as exc:
-                raise JobError(str(exc)) from None
-        elif candidate:
-            compile_to_order(Job('validate',site_id,commands,robot_id=candidate,resolved_steps=resolved),
-                             request.app.state.sites)
-        elif any(c.kind == 'docking' for c in commands):
-            from common.schemas import Pose
-            from fms_server.mapkit.chargers import require_charger
-            for c, step in zip(commands,resolved):
-                if c.kind=='docking':
-                    require_charger(request.app.state.sites.map_store(site_id),step['map_id'],
-                                    Pose(**step['pose']),c.params['entry'])
-        job = request.app.state.jobs.create(site_id,preset['commands'],body.robot_id,
-                    auto_assign=not bool(body.robot_id),preset_name=preset['name'],resolved_steps=resolved)
-        if body.robot_id:
-            try:
-                request.app.state.job_coordinator.dispatch(job.job_id)
-            except JobError:
-                request.app.state.jobs.delete(job.job_id)
-                raise
-        return JobOut.of(job)
-    return _call(request,site_id,publish)
+    state = request.app.state
+    blocked = state.sites.get_site(site_id).allocation_blocked if body.robot_id else None
+    if blocked:
+        raise HTTPException(409, f'{blocked} — 작업을 배정할 수 없다')
+    return _call(request, site_id, lambda store: JobOut.of(publish(
+        store, site_id, preset_id, registry=state.sites, jobs=state.jobs, coordinator=state.job_coordinator,
+        robot_id=body.robot_id, priority=body.priority, robot_group=body.robot_group,
+        not_before=body.not_before, deadline=body.deadline)))

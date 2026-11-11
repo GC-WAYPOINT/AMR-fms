@@ -6,7 +6,7 @@ const app = {
   page:'map', sites:[], site:null, detail:null, map:null, locations:[], pickupStations:[], cargo:null, robots:new Map(), jobs:[], steps:[], edit:null, selection:null, mapToken:0, siteToken:0
 };
 const titles = {
-  map:'실시간 맵', robots:'로봇', jobs:'작업 게시판', presets:'작업 프리셋', maps:'맵 관리', locations:'목적지·도킹', elevators:'엘리베이터', settings:'현장 설정', events:'이력'
+  map:'실시간 맵', robots:'로봇', jobs:'작업 게시판', presets:'작업 프리셋', maps:'맵 관리', locations:'목적지·도킹', elevators:'엘리베이터', settings:'현장 설정', events:'이력', ops:'운영 제어'
 };
 const types = {
   station:'작업 지점', charger:'충전소', parking:'주차 지점', waypoint:'경유점', pickup:'픽업 지점', tray_return:'반납 지점', other:'기타'
@@ -132,6 +132,7 @@ async function selectSite(id) {
   if(window.pointEditor && !window.pointEditor.canLeave()){ $("#siteSelect").value=app.site||""; return; }
   if(window.jobUI && !window.jobUI.canLeave()){ $("#siteSelect").value=app.site||""; return; }
   window.jobUI?.resetSite();
+  window.opsUI?.resetSite();window.opsUI?.refresh(true).catch(()=>{});
   if(window.zoneEditor && !window.zoneEditor.canLeave()){
     $('#siteSelect').value=app.site||'';
     return;
@@ -242,7 +243,8 @@ function renderRobots() {
     actions.push(button('등록 해제',async()=>{
       if(!confirm(`${assigned.robot_id}의 현장 등록을 해제할까요?`))return;await request(`${siteURL()}/robots/${enc(assigned.robot_id)}`,'DELETE');await refreshSite();await loadSites();
     },'danger'));
-    row(tb,[assigned.robot_id,label(r?.liveness)||'미접속',s?label(s.sub_state||s.state):'상태 수신 전',s?.battery?`${s.battery.charge.toFixed(0)}%`:'—',assigned.map_id,r?(r.map_synced?'일치':'불일치'):'확인 전',actions]);
+    window.opsUI?.robotActions(assigned,actions);
+    row(tb,[assigned.robot_id,label(r?.liveness)||'미접속',window.opsUI?window.opsUI.robotStatus(r,assigned):s?label(s.sub_state||s.state):'상태 수신 전',s?.battery?`${s.battery.charge.toFixed(0)}%`:'—',assigned.map_id,r?(r.map_synced?'일치':'불일치'):'확인 전',actions]);
   }
   empty(tb,7,app.site?'등록된 로봇이 없습니다.':'먼저 현장을 선택하세요.');
   const un=$('#unregistered');
@@ -346,6 +348,7 @@ function renderJobs() {
   for(const j of app.jobs){
     if(j.external_owner&&owners.has(j.external_owner))continue;   // 배송 행 아래에 묶어 보인다
     if(window.jobUI && !window.jobUI.visible(j))continue;
+    if(j.system&&!$('#showSystemJobs').checked)continue;   // 자동 충전·대기 복귀는 접어 둔다
     const actions=[];
     if(j.status==='pending'&&!j.external_owner){
       const choice=el('select');
@@ -368,7 +371,7 @@ function renderJobs() {
     if(j.status==='pending')actions.push(button('취소',async()=>{await request(`${siteURL()}/jobs/${enc(j.job_id)}/cancel`,'POST',{});await refreshSite();}));
     window.opsUI?.jobActions?.(j,actions);
     actions.push(button('이력',()=>window.eventsView?.show({job:j.job_id})));
-    row(tb,[j.preset_name?`${j.job_id} · ${j.preset_name}`:j.job_id,j.status==='pending'&&j.auto_assign?'자동 배정 대기':label(j.status),j.robot_id,j.commands.map(c=>window.jobUI?window.jobUI.describe(c):c.target).join(' → '),`${j.done_commands}/${j.total_commands}`,j.error||j.traffic_waiting||'—',actions]);
+    row(tb,[j.preset_name?`${j.job_id} · ${j.preset_name}`:j.job_id,j.status==='pending'&&j.auto_assign?'자동 배정 대기':label(j.status),j.robot_id,j.commands.map(c=>window.jobUI?window.jobUI.describe(c):c.target).join(' → '),`${j.done_commands}/${j.total_commands}`,[j.error||j.traffic_waiting,window.opsUI?.jobNote(j)].filter(Boolean).join(' · ')||'—',actions]);
   }
   empty(tb,7,app.site?'작업이 없습니다. 목적지를 등록한 뒤 작업을 만드세요.':'먼저 현장을 선택하세요.');
 }

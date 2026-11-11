@@ -683,3 +683,10 @@ tr.delivery-child td:first-child { padding-left:34px; }
 tr.bad td { color:#ffb2b8; }
 tr.warn td { color:#ffd78a; }
 label.check { display:flex; flex-direction:row; align-items:center; gap:6px; }
+
+/* 운영 제어 */
+.ops-banner { position:sticky; top:0; z-index:30; padding:8px 16px; background:#6b4e12; color:#fff3d6; font-weight:600; }
+.ops-banner.danger { background:#8a1f2b; color:#ffe3e6; }
+.ops-controls { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; }
+.schedule-days { border:0; padding:0; }
+.schedule-days div { display:flex; gap:10px; flex-wrap:wrap; }

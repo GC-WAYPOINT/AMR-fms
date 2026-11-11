@@ -43,6 +43,17 @@ class CommandIn(BaseModel):
 class CreateJobRequest(BaseModel):
     commands: list[CommandIn]
     robot_id: str | None = None
+    priority: int = Field(default=0, ge=-100, le=100)
+    not_before: str | None = None
+    deadline: str | None = None
+    robot_group: str | None = None
+    auto_assign: bool = False          # True 면 게시판에 올려 FMS 가 배정한다 (외부 주문)
+    external_id: str | None = Field(default=None, max_length=128)   # 멱등 키: 같은 값 재요청은 기존 작업 반환
+
+
+class PatchJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    priority: int = Field(ge=-100, le=100)
 
 
 class DispatchRequest(BaseModel):
@@ -70,6 +81,14 @@ class JobOut(BaseModel):
     created_at: str
     updated_at: str
     dispatched_at: str | None
+    priority: int = 0
+    not_before: str | None = None
+    deadline: str | None = None
+    deadline_missed: bool = False
+    robot_group: str | None = None
+    system: str | None = None
+    retry_of: str | None = None
+    external_id: str | None = None
 
     @classmethod
     def of(cls, job: Job) -> "JobOut":
@@ -92,6 +111,9 @@ class JobOut(BaseModel):
             created_at=job.created_at,
             updated_at=job.updated_at,
             dispatched_at=job.dispatched_at,
+            priority=job.priority, not_before=job.not_before, deadline=job.deadline,
+            deadline_missed=job.deadline_missed, robot_group=job.robot_group, system=job.system,
+            retry_of=job.retry_of, external_id=job.external_id,
         )
 
 
@@ -133,13 +155,68 @@ def _job_in_site(request: Request, site_id: str, job_id: str) -> Job:
 @router.post("", response_model=JobOut)
 def create_job(site_id: str, body: CreateJobRequest, request: Request) -> JobOut:
     _check_site(request, site_id)
+    store = _store(request)
     try:
-        job = _store(request).create(
-            site_id, [c.model_dump(exclude_none=True) for c in body.commands], body.robot_id
-        )
+        with _coordinator(request).lock:
+            if body.external_id:
+                existing = store.by_external_id(site_id, body.external_id)
+                if existing is not None:
+                    return JobOut.of(existing)   # 멱등: 같은 외부 주문은 한 번만 만든다
+            commands = [c.model_dump(exclude_none=True) for c in body.commands]
+            resolved = None
+            if body.auto_assign:
+                # 게시판 작업은 게시 시점의 좌표 스냅샷을 가진다 (프리셋 게시와 같다).
+                from fms_server.task import _parse_command, resolve_steps
+                resolved = resolve_steps([_parse_command(c) for c in commands], site_id, request.app.state.sites)
+            job = store.create(
+                site_id, commands, body.robot_id, auto_assign=body.auto_assign, resolved_steps=resolved,
+                priority=body.priority, not_before=body.not_before, deadline=body.deadline,
+                robot_group=body.robot_group, external_id=body.external_id,
+            )
     except JobError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     return JobOut.of(job)
+
+
+@router.patch("/{job_id}", response_model=JobOut)
+def patch_job(site_id: str, job_id: str, body: PatchJobRequest, request: Request) -> JobOut:
+    """우선순위 변경 (pending 만)."""
+    with _coordinator(request).lock:
+        job = _job_in_site(request, site_id, job_id)
+        if job.status.value != "pending":
+            raise HTTPException(status_code=409, detail="pending 작업만 우선순위를 바꿀 수 있다")
+        previous, job.priority = job.priority, body.priority
+        job.touch()
+        _store(request).save(job)
+    from fms_server.api.events import record
+    record(request, "job.priority", site_id=site_id, job_id=job_id, priority=body.priority, previous=previous)
+    return JobOut.of(job)
+
+
+@router.post("/{job_id}/retry", response_model=JobOut)
+def retry_job(site_id: str, job_id: str, request: Request) -> JobOut:
+    """종료된 작업의 명령을 복사해 새 pending 작업을 만든다. 좌표는 지금 목적지로 다시 잡는다."""
+    from fms_server.task import _parse_command, resolve_steps
+    with _coordinator(request).lock:
+        job = _job_in_site(request, site_id, job_id)
+        if job.external_owner:
+            raise HTTPException(status_code=409, detail="배송 하위 작업은 보관소 복귀 절차로 처리한다")
+        if job.system:
+            raise HTTPException(status_code=409, detail="시스템 작업은 재시도하지 않는다 (조건이 되면 다시 만들어진다)")
+        if not job.status.terminal:
+            raise HTTPException(status_code=409, detail=f"종료된 작업만 재시도할 수 있다 ({job.status.value})")
+        commands = [c.to_dict() for c in job.commands]
+        try:
+            resolved = resolve_steps([_parse_command(c) for c in commands], site_id, request.app.state.sites)
+            new = _store(request).create(
+                site_id, commands, None if job.auto_assign else job.robot_id,
+                auto_assign=job.auto_assign, preset_name=job.preset_name, resolved_steps=resolved,
+                priority=job.priority, robot_group=job.robot_group, retry_of=job.job_id)
+        except JobError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+    from fms_server.api.events import record
+    record(request, "job.retry", site_id=site_id, job_id=new.job_id, retry_of=job.job_id)
+    return JobOut.of(new)
 
 
 @router.get("", response_model=list[JobOut])
@@ -158,6 +235,9 @@ def dispatch_job(site_id: str, job_id: str, body: DispatchRequest, request: Requ
     job = _job_in_site(request, site_id, job_id)
     if job.external_owner:
         raise HTTPException(status_code=409, detail="배송 하위 작업은 보관소 연동이 배정한다")
+    blocked = request.app.state.sites.get_site(site_id).allocation_blocked
+    if blocked:
+        raise HTTPException(status_code=409, detail=f"{blocked} — 작업을 배정할 수 없다")
     try:
         job = _coordinator(request).dispatch(job_id, body.robot_id)
     except JobNotFound as exc:

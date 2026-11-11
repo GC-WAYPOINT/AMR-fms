@@ -60,3 +60,45 @@ class PresetStore:
         temp = path.with_suffix('.tmp')
         temp.write_text(json.dumps(rows, ensure_ascii=False, indent=2)+'\n')
         temp.replace(path)
+
+
+def publish(store, site_id, preset_id, *, registry, jobs, coordinator, robot_id=None, priority=0,
+            robot_group=None, not_before=None, deadline=None):
+    """프리셋을 작업으로 게시한다. 로봇을 지정하면 바로 배정하고, 아니면 게시판(자동 배정)에 올린다.
+
+    명령·좌표는 이 시점의 스냅샷이다. API 게시와 예약 실행(`scheduler.py`)이 같이 쓴다.
+    """
+    from fms_server.task import Job, compile_to_order
+    preset = store.get(site_id, preset_id)
+    commands = [_parse_command(c) for c in preset['commands']]
+    resolved = resolve_steps(commands, site_id, registry)
+    # 충전기 연결과 맵 일치도 게시 전에 검사한다. 직접 실행은 dispatch에서 가용성도 검사한다.
+    robots = registry.get_site(site_id).robots
+    candidate = robot_id or next((r.robot_id for r in robots.values()
+                                  if r.map_id == resolved[0]['map_id']), None)
+    start = registry.assignment_for(candidate) if candidate else None
+    if start and {r['map_id'] for r in resolved} != {start.map_id}:
+        # 여러 층: 승강기 연결·문 방향·충전기를 미리 확인한다
+        from fms_server.route import RouteError, build_plan
+        try:
+            build_plan(commands, resolved, start.map_id, site_id, coordinator._elevators(), registry=registry)
+        except RouteError as exc:
+            raise JobError(str(exc)) from None
+    elif candidate:
+        compile_to_order(Job('validate', site_id, commands, robot_id=candidate, resolved_steps=resolved), registry)
+    elif any(c.kind == 'docking' for c in commands):
+        from common.schemas import Pose
+        from fms_server.mapkit.chargers import require_charger
+        for c, step in zip(commands, resolved):
+            if c.kind == 'docking':
+                require_charger(registry.map_store(site_id), step['map_id'], Pose(**step['pose']), c.params['entry'])
+    job = jobs.create(site_id, preset['commands'], robot_id, auto_assign=not bool(robot_id),
+                      preset_name=preset['name'], resolved_steps=resolved, priority=priority,
+                      robot_group=robot_group, not_before=not_before, deadline=deadline)
+    if robot_id:
+        try:
+            coordinator.dispatch(job.job_id)
+        except JobError:
+            jobs.delete(job.job_id)
+            raise
+    return job

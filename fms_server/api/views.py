@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from common.schemas import State
 from fms_server.fleet import Fleet, RobotLiveness, RobotRecord
+from fms_server.robot_events import status_of
 from fms_server.sites import RobotAssignment, SiteRegistry
 
 
@@ -31,6 +32,11 @@ class RobotView(BaseModel):
     assigned_map_uid: Optional[str] = None       # FMS 전역 id (로봇이 보는 이름)
     # 배정 맵의 활성 버전과 로봇이 보고한 버전이 일치하는가
     map_synced: bool = False
+    # 점검(서비스 제외)·메모·그룹과 한 줄 표시 상태: working/idle/charging/manual/service/error/offline
+    in_service: bool = True
+    note: str = ""
+    groups: list[str] = []
+    display_status: str = "offline"
 
     connection: Optional[str] = None
     first_seen: float
@@ -65,7 +71,8 @@ class RobotView(BaseModel):
                 active_map_version is not None
                 and reported_version == active_map_version
             )
-            available = record.available_for_job(stale_after) and map_synced
+            available = (record.available_for_job(stale_after) and map_synced
+                         and assignment.in_service)
 
         return cls(
             robot_id=record.robot_id,
@@ -76,6 +83,11 @@ class RobotView(BaseModel):
             assigned_map_id=assignment.map_id if assignment else None,
             assigned_map_uid=assigned_map_uid,
             map_synced=map_synced,
+            in_service=assignment.in_service if assignment else True,
+            note=assignment.note if assignment else "",
+            groups=list(assignment.groups) if assignment else [],
+            display_status=(status_of(record.state, assignment.in_service if assignment else True)
+                            if base_liveness == RobotLiveness.ONLINE else "offline"),
             connection=record.connection.value if record.connection is not None else None,
             first_seen=record.first_seen,
             last_state_at=record.last_state_at,

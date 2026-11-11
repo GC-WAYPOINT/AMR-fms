@@ -68,6 +68,9 @@ class RobotAssignmentOut(BaseModel):
     site_id: str
     map_id: str
     registered_at: str
+    in_service: bool = True
+    note: str = ""
+    groups: list[str] = []
 
 
 class SiteOut(BaseModel):
@@ -76,6 +79,7 @@ class SiteOut(BaseModel):
     created_at: str
     maps: list[MapSummaryOut]
     robots: list[RobotAssignmentOut]
+    ops: dict = {}
 
 
 class SiteBriefOut(BaseModel):
@@ -116,7 +120,10 @@ class RegisterRobotRequest(BaseModel):
 
 
 class ReassignRobotRequest(BaseModel):
-    map_id: str
+    map_id: str | None = None           # 없으면 맵 배정은 그대로
+    in_service: bool | None = None      # False = 점검(서비스 제외)
+    note: str | None = None
+    groups: list[str] | None = None
 
 
 class RegisterRobotResultOut(BaseModel):
@@ -150,7 +157,8 @@ def _map_summary_out(summary) -> MapSummaryOut:
 
 def _assignment_out(a) -> RobotAssignmentOut:
     return RobotAssignmentOut(
-        robot_id=a.robot_id, site_id=a.site_id, map_id=a.map_id, registered_at=a.registered_at
+        robot_id=a.robot_id, site_id=a.site_id, map_id=a.map_id, registered_at=a.registered_at,
+        in_service=a.in_service, note=a.note, groups=list(a.groups),
     )
 
 
@@ -204,6 +212,7 @@ def get_site(site_id: str, request: Request) -> SiteOut:
         created_at=site.created_at,
         maps=[_map_summary_out(m) for m in maps],
         robots=[_assignment_out(a) for a in site.robots.values()],
+        ops=site.ops,
     )
 
 
@@ -382,13 +391,28 @@ def reassign_robot(
     try:
         with request.app.state.job_coordinator.lock:
             from fms_server.api.traffic import ensure_robot_editable
-            ensure_robot_editable(request, robot_id, site_id, body.map_id)
-            assignment = _registry(request).register_robot(site_id, robot_id, body.map_id)
+            registry = _registry(request)
+            current = registry.get_site(site_id).robots.get(robot_id)
+            sent = False
+            if body.map_id is not None and (current is None or current.map_id != body.map_id):
+                ensure_robot_editable(request, robot_id, site_id, body.map_id)
+                registry.register_robot(site_id, robot_id, body.map_id)
+                sent = True
+            elif current is None:
+                raise SiteNotFound(f"로봇 {robot_id} 는 site {site_id} 에 등록돼 있지 않다")
+            was_in_service = current.in_service if current else True
+            assignment = registry.update_robot(site_id, robot_id, in_service=body.in_service,
+                                               note=body.note, groups=body.groups)
     except SiteNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from None
     except SiteError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
-    sent = _coordinator(request).notify_robot(robot_id)
+    if sent or body.map_id is not None:
+        sent = _coordinator(request).notify_robot(robot_id)
+    if assignment.in_service != was_in_service:
+        from fms_server.api.events import record
+        record(request, "robot.service", site_id=site_id, robot_id=robot_id,
+               in_service=assignment.in_service, note=assignment.note)
     return RegisterRobotResultOut(assignment=_assignment_out(assignment), set_map_sent=sent)
 
 
