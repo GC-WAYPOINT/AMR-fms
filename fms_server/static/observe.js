@@ -61,7 +61,7 @@ window.observeUI = (() => {
       tile(tiles, '주행 거리', `${fmt(t.distance / 1000, ' km', 2)}`, `충전 ${t.charges}회 · ${duration(t.charge_seconds)}`);
       tile(tiles, '교통 대기', duration(t.traffic_wait_avg), `${t.traffic_waits}회 · 합계 ${duration(t.traffic_wait_total)}`);
       tile(tiles, '승강기 대기', duration(t.elevator_wait_avg), `교착 ${t.deadlocks} · 정체 ${t.stalls}`);
-      tile(tiles, '배송 리드타임', duration(t.delivery_lead_avg), `배송 ${t.deliveries}건 · 마감 초과 ${t.deadline_missed}`);
+      tile(tiles, '마감 초과', `${t.deadline_missed}건`, '마감 시각을 넘긴 작업');
       const labels = k.buckets.map(b => { const d = new Date(b.start * 1000); return day ? `${d.getMonth() + 1}/${d.getDate()}` : `${d.getHours()}시`; });
       const jobs = [{name:'완료', color:'#59c8be', values:k.buckets.map(b => b.completed)}, {name:'실패', color:'#f2848c', values:k.buckets.map(b => b.failed)},
         {name:'취소', color:'#7d8da3', values:k.buckets.map(b => b.canceled)}];

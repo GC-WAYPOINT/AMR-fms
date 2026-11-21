@@ -23,7 +23,6 @@ log = logging.getLogger("fms.alerts")
 
 OFFLINE_AFTER = 30.0      # LOST/STALE 이 이만큼 이어지면 알린다 (초)
 PENDING_AFTER = 600.0     # 게시판 작업이 이만큼 배정되지 않으면 알린다 (초)
-LOAD_MISMATCH_AFTER = 15.0   # 로봇이 보고한 적재물과 장부가 이만큼 계속 다르면 알린다 (초)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS alerts(
@@ -51,12 +50,9 @@ def _row(r) -> dict:
 
 
 class AlertManager:
-    def __init__(self, events, coordinator, *, battery=None, locker=None, elevators=None, cargo=None,
-                 clock=time.time) -> None:
+    def __init__(self, events, coordinator, *, battery=None, elevators=None, clock=time.time) -> None:
         self.events, self.coordinator = events, coordinator
-        self.battery, self.locker, self._elevators = battery, locker, elevators
-        self.cargo = cargo
-        self._mismatch_since: dict[str, float] = {}
+        self.battery, self._elevators = battery, elevators
         self._clock = clock
         self._lock = threading.RLock()
         self._offline_since: dict[str, float] = {}
@@ -158,8 +154,8 @@ class AlertManager:
         except Exception:
             log.exception("알림 규칙 평가 실패")
             return
-        state_rules = ("robot_error", "robot_offline", "battery_critical", "job_pending", "deadlock", "cargo_mismatch",
-                       "elevator_stale", "elevator_fault", "elevator_attention", "delivery_blocked")
+        state_rules = ("robot_error", "robot_offline", "battery_critical", "job_pending", "deadlock",
+                       "elevator_stale", "elevator_fault", "elevator_attention")
         for key, alert in wanted.items():
             self.open(alert.pop("rule"), key, alert.pop("message"), **alert)
         for key in self._open_keys():
@@ -202,21 +198,6 @@ class AlertManager:
                         wanted[f"battery_critical:{robot_id}"] = dict(
                             common, rule="battery_critical", severity="error",
                             message=f"로봇 {robot_id} 배터리 {state.battery.charge:.0f}% (위험 기준 {policy['critical']}%)")
-                    # 적재 상태 대조: State.loads 를 보고하는 로봇만 (factsheet.reports_loads). 아니면 장부만 믿는다.
-                    if self.cargo is not None and record.factsheet is not None and record.factsheet.reports_loads:
-                        trays = self.cargo.robot_cargo(robot_id)["trays"]
-                        if any(t["state"] in ("loading", "unloading", "unknown") for t in trays):
-                            self._mismatch_since.pop(robot_id, None)      # 전이 중에는 비교하지 않는다
-                        else:
-                            ledger = sorted(t["last_parcel_id"] for t in trays
-                                            if t["state"] == "loaded" and t.get("last_parcel_id"))
-                            reported = sorted(load.payload_id for load in state.loads)
-                            if ledger == reported:
-                                self._mismatch_since.pop(robot_id, None)
-                            elif now - self._mismatch_since.setdefault(robot_id, now) >= LOAD_MISMATCH_AFTER:
-                                wanted[f"cargo_mismatch:{robot_id}"] = dict(
-                                    common, rule="cargo_mismatch", severity="error", ledger=ledger, reported=reported,
-                                    message=f"로봇 {robot_id} 적재물 불일치 — 장부 {ledger or '없음'}, 로봇 보고 {reported or '없음'}")
                 for job in jobs.list(site.site_id):
                     if job.status.value != "pending" or not job.auto_assign:
                         continue
@@ -250,12 +231,4 @@ class AlertManager:
                                 common, rule="elevator_attention", severity="error",
                                 robot_id=snap["attention"].get("robot_id"),
                                 message=f"승강기 {eid} 확인 필요: {snap['attention'].get('reason')}")
-            if self.locker is not None:
-                for delivery in self.locker.deliveries.values():
-                    if delivery.get("phase") == "blocked":
-                        site_id = (delivery.get("config") or {}).get("site_id")
-                        wanted[f"delivery_blocked:{delivery['job_id']}"] = dict(
-                            site_id=site_id, job_id=delivery["job_id"], robot_id=delivery.get("robot_id"),
-                            rule="delivery_blocked", severity="error",
-                            message=f"배송 {delivery['job_id']} 차단: {delivery.get('error') or ''}")
         return wanted

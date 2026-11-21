@@ -8,9 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from common.map_annotations import Point, Zone, ZoneType
-from common.schemas import ActionType, Factsheet, LoadInfo
-from fms_server.alerts import LOAD_MISMATCH_AFTER, AlertManager
-from fms_server.events import EventLog
+from common.schemas import ActionType, Factsheet
 from fms_server.main import app
 from fms_server.mqtt_client import _parse_topic
 from fms_server.task import JobStatus
@@ -77,37 +75,3 @@ def test_candidates_are_filtered_by_supported_actions(env):
     other = c.post(BASE + f"/presets/{p['preset_id']}/publish", json={}).json()["job_id"]
     coord.allocate_pending()
     assert jobs.get(other).status == JobStatus.PENDING and "factsheet" in jobs.get(other).error
-
-
-def test_load_mismatch_alert_only_for_reporting_robots(env, tmp_path):
-    c, registry, jobs, coord, mqtt, online = env
-    events = EventLog(tmp_path / "ev")
-    now = [time.time()]
-    ledger = {"AMR-001": ["P1"], "AMR-002": ["P9"]}
-
-    class Cargo:
-        def robot_cargo(self, robot_id):
-            return {"trays": [{"tray_id": "T1", "state": "loaded", "last_parcel_id": p, "parcel": {"parcel_id": p}}
-                              for p in ledger.get(robot_id, [])]}
-
-    manager = AlertManager(events, coord, cargo=Cargo(), clock=lambda: now[0])
-
-    def report(robot, payloads):
-        state = online(robot)
-        app.state.fleet.apply_state(state.model_copy(update={
-            "loads": [LoadInfo(tray=f"T{i + 1}", payload_id=p) for i, p in enumerate(payloads)]}))
-
-    report("AMR-001", [])            # 장부에는 P1 이 실려 있는데 로봇은 비었다고 보고
-    report("AMR-002", [])            # 보고 기능이 없는 구형 — 장부만 믿는다
-    app.state.fleet.apply_factsheet(sheet("AMR-001", reports_loads=True))
-    manager.tick()
-    assert manager.list(site="hq") == []                       # 잠깐 어긋난 것은 알리지 않는다 (적재 중 전이)
-    now[0] += LOAD_MISMATCH_AFTER + 1
-    manager.tick()
-    alerts = manager.list(site="hq")
-    assert [a["key"] for a in alerts] == ["cargo_mismatch:AMR-001"]
-    assert alerts[0]["data"]["ledger"] == ["P1"] and alerts[0]["data"]["reported"] == []
-    report("AMR-001", ["P1"])
-    manager.tick()
-    assert manager.list(site="hq") == []
-    events.stop()

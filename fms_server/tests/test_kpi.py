@@ -25,7 +25,6 @@ def fill(log):
     r("job.failed", 700, job_id="hq-J0002", robot_id="R2", duration=200.0, error="NO_PATH")
     r("job.canceled", 800, job_id="hq-J0003")
     r("job.success", 900, job_id="hq-J0004", robot_id="R1", system="charge", duration=50.0)   # 시스템 작업
-    r("job.success", 950, job_id="hq-J0005", robot_id="R1", delivery="L-1", duration=50.0)    # 배송 하위 작업
     r("robot.usage", 1000, robot_id="R1", status="working", seconds=600.0, distance=120.5)
     r("robot.usage", 1000, robot_id="R1", status="idle", seconds=200.0, distance=0.0)
     r("robot.usage", 1000, robot_id="R2", status="charging", seconds=400.0, distance=3.0)
@@ -33,8 +32,6 @@ def fill(log):
     r("robot.charging_started", 1100, robot_id="R2")
     r("traffic.wait_end", 1200, robot_id="R1", seconds=12.0)
     r("traffic.wait_end", 1300, robot_id="R2", seconds=8.0)
-    r("delivery.phase", 1400, job_id="L-1", phase="queued")
-    r("delivery.phase", 2000, job_id="L-1", phase="done")
     r("job.success", 3600 + 10, job_id="hq-J0006", robot_id="R1", duration=100.0)             # 다음 시간대
     log.record("elevator.lease", ts=T0 + 1500, job_id="hq-J0001", elevator_id="e", waited=30.0)   # site 없음
     log.record("job.success", site_id="other", ts=T0 + 100, job_id="other-J0001", duration=1.0)
@@ -51,7 +48,6 @@ def test_kpi_totals_buckets_and_robots(log):
     assert total["utilization"] == pytest.approx(600 / 1200)          # offline 시간은 분모에서 뺀다
     assert total["traffic_wait_avg"] == 10.0 and total["traffic_waits"] == 2
     assert total["elevator_wait_avg"] == 30.0
-    assert total["deliveries"] == 1 and total["delivery_lead_avg"] == 600.0
     assert [b["completed"] for b in out["buckets"]] == [1, 1]
     assert out["buckets"][0]["start"] == T0 and out["buckets"][1]["start"] == T0 + 3600
     robots = {r["robot_id"]: r for r in out["robots"]}

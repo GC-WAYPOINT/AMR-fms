@@ -381,13 +381,11 @@ def delete_station(maps: MapStore, locations: LocationStore, map_id: str, statio
 
 
 # =============================================================================
-# 참조 검사 (작업·프리셋·보관소 설정)
+# 참조 검사 (작업·프리셋)
 # =============================================================================
 
 def describe_references(name: str, *, presets: Iterable[dict], jobs: Iterable,
-                        locker_config: Optional[dict], statuses: Iterable[str],
-                        station_id: Optional[str] = None,
-                        active_parcels: Iterable[str] = ()) -> Optional[str]:
+                        statuses: Iterable[str]) -> Optional[str]:
     """이 이름을 참조하는 것이 있으면 사람이 읽을 사유를 돌려준다."""
     statuses = set(statuses)
     reasons = []
@@ -404,10 +402,4 @@ def describe_references(name: str, *, presets: Iterable[dict], jobs: Iterable,
             job_ids.append(job.job_id)
     if job_ids:
         reasons.append(f"작업 {', '.join(job_ids)}")
-    if locker_config and (locker_config.get("pickup_target") == name
-                          or (station_id and locker_config.get("pickup_station_id") == station_id)):
-        reasons.append("보관소 연동 설정")
-    active_parcels = list(active_parcels)
-    if active_parcels:
-        reasons.append(f"미반납 물품·트레이 {len(active_parcels)}개")
     return " / ".join(reasons) or None

@@ -35,8 +35,6 @@ from fms_server.api.zones import router as zones_router
 from fms_server.api.traffic import router as traffic_router
 from fms_server.api.map_points import router as map_points_router
 from fms_server.api.pickup_stations import router as pickup_stations_router
-from fms_server.api.cargo import router as cargo_router
-from fms_server.cargo import CargoStore
 from fms_server.config import settings
 from fms_server.elevator_ctl import ElevatorController
 from fms_server.elevator_sim import BuiltinElevatorSim
@@ -46,8 +44,6 @@ from fms_server.fleet import Fleet
 from fms_server.mqtt_client import FmsMqttClient
 from fms_server.sites import SiteRegistry
 from fms_server.task import JobCoordinator, JobStore
-from fms_server.locker import LockerBridge
-from fms_server.api.locker import router as locker_router
 from fms_server.api.events import router as events_router
 from fms_server.api.ops import router as ops_router
 from fms_server.api.charging import router as charging_router
@@ -105,12 +101,7 @@ async def lifespan(app: FastAPI):
     allocator = JobAllocator(job_coordinator, ticks=[
         ("battery", battery.tick), ("scheduler", scheduler.tick), ("robot-events", robot_events.tick)])
     app.state.battery, app.state.schedules, app.state.scheduler = battery, schedules, scheduler
-    cargo = CargoStore(settings.data_root)
-    app.state.cargo = cargo
-    locker = LockerBridge(registry, fleet, jobs, job_coordinator, mqtt, settings.data_root, cargo=cargo, events=events)
-    app.state.locker = locker
-    alerts = AlertManager(events, job_coordinator, battery=battery, locker=locker, elevators=elevator_store,
-                          cargo=cargo)
+    alerts = AlertManager(events, job_coordinator, battery=battery, elevators=elevator_store)
     webhooks = WebhookManager(events, settings.data_root)
     event_stream = EventStream(events)
     allocator.ticks.append(("alerts", alerts.tick))
@@ -144,12 +135,10 @@ async def lifespan(app: FastAPI):
     if elevator_sim is not None:
         elevator_sim.start()
     allocator.start()
-    locker.start()
     log.info("FMS 서버 시작 완료")
     try:
         yield
     finally:
-        locker.stop()
         allocator.stop()
         if elevator_sim is not None:
             elevator_sim.stop()
@@ -178,9 +167,7 @@ app.include_router(zones_router, dependencies=_AUTH)
 app.include_router(traffic_router, dependencies=_AUTH)
 app.include_router(map_points_router, dependencies=_AUTH)
 app.include_router(pickup_stations_router, dependencies=_AUTH)
-app.include_router(cargo_router, dependencies=_AUTH)
 app.include_router(elevators_router, dependencies=_AUTH)
-app.include_router(locker_router, dependencies=_AUTH)
 app.include_router(events_router, dependencies=_AUTH)
 app.include_router(ops_router, dependencies=_AUTH)
 app.include_router(observe_router, dependencies=_AUTH)

@@ -205,7 +205,6 @@ class Job:
 
     auto_assign: bool = False
     preset_name: Optional[str] = None
-    external_owner: Optional[str] = None  # 외부 배송이 여러 하위 작업 동안 로봇을 예약한다
     resolved_steps: list[dict] = field(default_factory=list)
     order_snapshot: Optional[dict] = None
     traffic: dict = field(default_factory=dict)  # 대기·출구 삽입과 원래 명령의 대응
@@ -244,7 +243,6 @@ class Job:
             "commands": [c.to_dict() for c in self.commands],
             "status": self.status.value,
             "auto_assign": self.auto_assign, "preset_name": self.preset_name,
-            "external_owner": self.external_owner,
             "resolved_steps": self.resolved_steps, "order_snapshot": self.order_snapshot,
             "traffic": self.traffic,
             "plan": self.plan, "stage": self.stage, "stage_data": self.stage_data,
@@ -270,7 +268,6 @@ class Job:
             commands=[_parse_command(e) for e in data.get("commands", [])],
             status=JobStatus(data.get("status", "pending")),
             auto_assign=data.get("auto_assign", False), preset_name=data.get("preset_name"),
-            external_owner=data.get("external_owner"),
             resolved_steps=data.get("resolved_steps", []), order_snapshot=data.get("order_snapshot"),
             traffic=data.get("traffic", {}),
             plan=data.get("plan", []), stage=data.get("stage", 0), stage_data=data.get("stage_data", {}),
@@ -349,7 +346,7 @@ class JobStore:
 
     def create(
         self, site_id: str, commands: list[dict], robot_id: Optional[str] = None,
-        *, auto_assign=False, preset_name=None, resolved_steps=None, external_owner=None,
+        *, auto_assign=False, preset_name=None, resolved_steps=None,
         priority: int = 0, not_before=None, deadline=None, robot_group=None, system=None,
         retry_of=None, external_id=None,
     ) -> Job:
@@ -366,7 +363,6 @@ class JobStore:
             job_id = f"{site_id}-J{n:04d}"
             job = Job(job_id=job_id, site_id=site_id, commands=parsed, robot_id=robot_id,
                       auto_assign=auto_assign, preset_name=preset_name,
-                      external_owner=external_owner,
                       resolved_steps=copy.deepcopy(resolved_steps or []),
                       priority=int(priority), not_before=not_before, deadline=deadline,
                       robot_group=robot_group or None, system=system, retry_of=retry_of,
@@ -526,7 +522,6 @@ class JobCoordinator:
         self.battery = None      # BatteryManager: 충전 정책(min_job_charge)·비켜주기. 없으면 이전 동작
         self._unsubscribe = None
         self._lock = threading.RLock()
-        self._reservations: dict[str, str] = {}
         from fms_server.traffic import TrafficController
         self._traffic = TrafficController(registry, fleet, store, events=events)
 
@@ -546,8 +541,6 @@ class JobCoordinator:
                 data.setdefault("preset", job.preset_name)
             if job.system:
                 data.setdefault("system", job.system)       # KPI 는 시스템 작업을 따로 센다
-            if job.external_owner:
-                data.setdefault("delivery", job.external_owner)
         self._events.record(kind, severity=severity, **data)
 
     @staticmethod
@@ -566,23 +559,8 @@ class JobCoordinator:
 
     @property
     def lock(self):
-        """외부 배송 전이도 배정과 같은 락에서 처리한다."""
+        """작업 상태 변경은 모두 이 락 안에서 한다."""
         return self._lock
-
-    @_serialized
-    def reserve_robot(self, robot_id: str, owner: str) -> None:
-        if self._reservations.get(robot_id, owner) != owner:
-            raise JobError(f"로봇 {robot_id}는 다른 배송이 예약했다")
-        if any(j.robot_id == robot_id and not j.status.terminal
-               and j.status != JobStatus.PENDING and j.external_owner != owner
-               for j in self._store.list()):
-            raise JobError(f"로봇 {robot_id}는 다른 작업을 수행 중이다")
-        self._reservations[robot_id] = owner
-
-    @_serialized
-    def release_robot(self, robot_id: str, owner: str) -> None:
-        if self._reservations.get(robot_id) == owner:
-            del self._reservations[robot_id]
 
     # -- 수명 주기 ----------------------------------------------------
 
@@ -646,12 +624,6 @@ class JobCoordinator:
         if not target_robot:
             raise JobError("배정할 로봇이 없다 (robot_id 를 줘라)")
 
-        owner = self._reservations.get(target_robot)
-        if owner is not None and owner != job.external_owner:
-            raise JobError(f"로봇 {target_robot}는 배송 {owner}가 예약 중이다")
-        if job.external_owner and owner != job.external_owner:
-            raise JobError("외부 배송 예약을 먼저 복원해야 한다")
-
         if any(j.robot_id == target_robot and j.status in (JobStatus.ASSIGNED, JobStatus.WORKING, JobStatus.CANCELING)
                for j in self._store.list()):
             raise JobError(f"로봇 {target_robot}는 이미 다른 작업에 배정되어 있다")
@@ -662,7 +634,7 @@ class JobCoordinator:
         if record.state.battery.charge <= 0:
             raise JobError("배터리가 소진된 로봇에는 작업을 배정할 수 없다")
         policy = self._policy(job.site_id)
-        if (policy and policy["enabled"] and job.system != "charge" and not job.external_owner
+        if (policy and policy["enabled"] and job.system != "charge"
                 and record.state.battery.charge < policy["min_job_charge"]):
             raise JobError(f"배터리 {record.state.battery.charge:.0f}% — 작업 수락 기준 "
                            f"{policy['min_job_charge']}% 미만 (충전 대기)")
@@ -674,8 +646,8 @@ class JobCoordinator:
         assignment = self._registry.assignment_for(target_robot)
         if assignment is None or assignment.site_id != job.site_id:
             raise JobError(f"로봇 {target_robot} 가 site {job.site_id} 에 등록돼 있지 않다")
-        # 점검 중인 로봇은 새 작업을 받지 않는다. 이미 진행 중인 배송의 하위 작업은 끝까지 간다.
-        if not assignment.in_service and not job.external_owner:
+        # 점검 중인 로봇은 새 작업을 받지 않는다.
+        if not assignment.in_service:
             raise JobError(f"로봇 {target_robot} 는 점검 중이다 (서비스 제외)")
 
         # 맵 버전 게이팅 — 오래된 금지구역 들고 도는 로봇에 job 안 준다
@@ -888,11 +860,6 @@ class JobCoordinator:
                 elif state.state == RobotState.ERROR:
                     self._fail_multi(job, "로봇이 ERROR 상태")
                 elif state.state in (RobotState.IDLE, RobotState.CHARGING):
-                    if job.external_owner and any(n["cmd"] is not None
-                            and n.get("action", {}).get("type") in ("pickup", "drop")
-                            and job.done_commands <= n["cmd"] for n in stage["nodes"] if n.get("action")):
-                        self._fail_multi(job, "적재·하차 FINISHED 보고 누락 — 확인 필요")
-                        return False
                     for n in stage["nodes"]:
                         if n["cmd"] is not None:
                             job.done_commands = max(job.done_commands, n["cmd"] + 1)
@@ -1274,8 +1241,6 @@ class JobCoordinator:
                 if site.paused_for(assignment.map_id):
                     reason = "현장 정지 중"
                     continue
-                if record.robot_id in self._reservations:
-                    continue
                 records.append(record)
             try:
                 order, why = rank_candidates(job, records, self._registry, self._elevators(),
@@ -1471,11 +1436,6 @@ class JobCoordinator:
             elif state.state == RobotState.ERROR:
                 self._finish(job, JobStatus.FAILED, "로봇이 ERROR 상태")
             elif state.state in (RobotState.IDLE, RobotState.CHARGING):
-                if job.external_owner and any(isinstance(c, ActionCommand)
-                        and c.kind in ("pickup", "drop") and job.done_commands <= i
-                        for i, c in enumerate(job.commands)):
-                    self._finish(job, JobStatus.FAILED, "배송 단계 완료 보고 누락 — 적재·하차 확인 필요")
-                    return
                 job.done_commands = len(job.commands)
                 self._finish(job, JobStatus.SUCCESS, None)
 

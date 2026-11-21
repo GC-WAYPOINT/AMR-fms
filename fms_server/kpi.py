@@ -13,7 +13,7 @@ from typing import Optional
 BUCKETS = {"hour": 3600, "day": 86400}
 KINDS = ("job.assigned", "job.success", "job.failed", "job.canceled", "job.deadline_missed",
          "robot.usage", "robot.charging_started", "traffic.wait_end", "traffic.deadlock", "traffic.stall",
-         "elevator.lease", "delivery.phase")
+         "elevator.lease")
 STATUSES = ("working", "idle", "charging", "manual", "service", "error", "offline")
 
 
@@ -26,7 +26,7 @@ def _empty(start: float) -> dict:
             "assign_wait": [0.0, 0], "duration": [0.0, 0], "distance": 0.0,
             "seconds": {s: 0.0 for s in STATUSES}, "charges": 0,
             "traffic_wait": [0.0, 0], "elevator_wait": [0.0, 0], "deadlocks": 0, "stalls": 0,
-            "deadline_missed": 0, "deliveries": 0, "delivery_lead": [0.0, 0]}
+            "deadline_missed": 0}
 
 
 def _finish(b: dict) -> dict:
@@ -45,13 +45,12 @@ def _finish(b: dict) -> dict:
         "traffic_waits": b["traffic_wait"][1],
         "elevator_wait_avg": _avg(*b["elevator_wait"]), "elevator_wait_total": round(b["elevator_wait"][0], 1),
         "deadlocks": b["deadlocks"], "stalls": b["stalls"], "deadline_missed": b["deadline_missed"],
-        "deliveries": b["deliveries"], "delivery_lead_avg": _avg(*b["delivery_lead"]),
     }
 
 
-def _apply(b: dict, event: dict, deliveries: dict) -> None:
+def _apply(b: dict, event: dict) -> None:
     kind, data = event["kind"], event["data"]
-    counted = not data.get("system") and not data.get("delivery")   # 일반 작업만 작업 지표에 넣는다
+    counted = not data.get("system")   # 일반 작업만 작업 지표에 넣는다
     if kind == "job.assigned":
         if counted and data.get("waited") is not None:
             b["assign_wait"][0] += data["waited"]
@@ -84,12 +83,7 @@ def _apply(b: dict, event: dict, deliveries: dict) -> None:
         if data.get("waited") is not None:
             b["elevator_wait"][0] += data["waited"]
             b["elevator_wait"][1] += 1
-    elif kind == "delivery.phase" and event["job_id"]:
-        first = deliveries.setdefault(event["job_id"], event["ts"])
-        if data.get("phase") == "done":
-            b["deliveries"] += 1
-            b["delivery_lead"][0] += event["ts"] - first
-            b["delivery_lead"][1] += 1
+
 
 
 def compute(events, site_id: str, start: float, end: float, bucket: str = "hour") -> dict:
@@ -109,7 +103,6 @@ def compute(events, site_id: str, start: float, end: float, bucket: str = "hour"
         t += size
     total = _empty(start)
     robots: dict[str, dict] = {}
-    deliveries: dict[str, float] = {}
     events.flush()
     marks = ",".join("?" * len(KINDS))
     # 승강기 임대 이벤트는 site 를 모른다 (승강기 id 만 있다). 작업 id 접두어(site-J…)로 고른다.
@@ -123,12 +116,11 @@ def compute(events, site_id: str, start: float, end: float, bucket: str = "hour"
         b = buckets.get(event["ts"] - (event["ts"] % size))
         if b is None:
             continue
-        seen = dict(deliveries)
-        _apply(b, event, deliveries)
-        _apply(total, event, seen)
+        _apply(b, event)
+        _apply(total, event)
         if event["robot_id"] and event["kind"] in ("robot.usage", "robot.charging_started", "job.success", "job.failed"):
             r = robots.setdefault(event["robot_id"], _empty(start))
-            _apply(r, event, {})
+            _apply(r, event)
     return {
         "site_id": site_id, "from": start, "to": end, "bucket": bucket,
         "totals": _finish(total),

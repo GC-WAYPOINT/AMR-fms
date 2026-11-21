@@ -28,7 +28,7 @@ def eligible(job, record, assignment, policy=None) -> Optional[str]:
     """이 로봇이 후보가 될 수 없는 이유 (될 수 있으면 None)."""
     if assignment is None or assignment.site_id != job.site_id:
         return "다른 현장 로봇"
-    if not assignment.in_service and not job.external_owner:
+    if not assignment.in_service:
         return "점검 중인 로봇"
     if job.robot_group and job.robot_group not in assignment.groups:
         return f"그룹 {job.robot_group} 로봇이 아니다"

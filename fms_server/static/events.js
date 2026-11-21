@@ -12,14 +12,14 @@ window.eventsView = (() => {
     'traffic.wait':'교통 대기', 'traffic.wait_end':'교통 대기 해제', 'traffic.reserve':'교통 예약', 'traffic.release':'교통 예약 해제',
     'traffic.deadlock':'교착', 'traffic.stall':'정체', 'traffic.conflict':'경로 교차 예고', 'traffic.revoke':'예약 회수',
     'elevator.lease':'승강기 임대', 'elevator.release':'승강기 반납', 'elevator.fault':'승강기 장애', 'elevator.reroute':'승강기 예비 전환',
-    'elevator.recover':'승강기 칸 내 복구', 'delivery.phase':'배송 단계', 'site.paused':'현장 정지', 'site.resumed':'현장 재개',
+    'elevator.recover':'승강기 칸 내 복구', 'site.paused':'현장 정지', 'site.resumed':'현장 재개',
     'site.evacuation':'대피', 'map.activated':'맵 활성화', 'zone.created':'구역 생성', 'zone.updated':'구역 수정', 'zone.deleted':'구역 삭제',
     'charge.requested':'자동 충전', 'charge.no_charger':'빈 충전소 없음', 'staging.requested':'대기 위치 복귀',
     'schedule.run':'예약 실행', 'alert.opened':'알림 발생', 'alert.resolved':'알림 해소', 'alert.acked':'알림 확인',
     'server.start':'서버 시작', 'server.stop':'서버 종료'
   };
   const groups = [['','전체'],['job.','작업'],['robot.state,robot.liveness,robot.paused,robot.resumed,robot.mode,robot.localization,robot.error,robot.error_cleared,robot.battery,robot.charging_started,robot.charging_stopped,robot.command,robot.service','로봇'],
-    ['traffic.','교통'],['elevator.','승강기'],['delivery.','배송'],['site.,map.,zone.,schedule.,server.','운영 조작'],['charge.,staging.','충전·대기'],['alert.','알림'],['robot.usage','사용량(원본)']];
+    ['traffic.','교통'],['elevator.','승강기'],['site.,map.,zone.,schedule.,server.','운영 조작'],['charge.,staging.','충전·대기'],['alert.','알림'],['robot.usage','사용량(원본)']];
   const severities = {info:'정보', warning:'주의', error:'오류'};
   const form = $('#eventFilter'), tb = $('#eventRows');
   let busy = false;

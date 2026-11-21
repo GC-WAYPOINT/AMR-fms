@@ -3,7 +3,7 @@
 const $ = s => document.querySelector(s);
 const enc = encodeURIComponent;
 const app = {
-  page:'map', sites:[], site:null, detail:null, map:null, locations:[], pickupStations:[], cargo:null, robots:new Map(), jobs:[], steps:[], edit:null, selection:null, mapToken:0, siteToken:0
+  page:'map', sites:[], site:null, detail:null, map:null, locations:[], pickupStations:[], robots:new Map(), jobs:[], steps:[], edit:null, selection:null, mapToken:0, siteToken:0
 };
 const titles = {
   map:'실시간 맵', robots:'로봇', jobs:'작업 게시판', presets:'작업 프리셋', maps:'맵 관리', locations:'목적지·도킹', elevators:'엘리베이터', settings:'현장 설정', events:'이력', ops:'운영 제어', alerts:'알림', stats:'통계'
@@ -306,63 +306,14 @@ function resetEdit() {
   $('#cancelLocEdit').hidden=true;
 }
 $('#cancelLocEdit').onclick=resetEdit;
-// 보관소 배송 1건은 한 행으로 보이고, 펼치면 하위 작업(픽업 이동·적재·세대 하차·반납)이 들여쓰기로 보인다.
-const expandedDeliveries=new Set();
-function deliveryJobStatus(d){
-  return d.phase==='queued'?'pending':['done','canceled'].includes(d.phase)?'success':'working';
-}
-// 로봇 배정 전 배송 취소. 갈 수 없는 세대(목적지 연결 없음) 물품은 보관소가 직접 수령으로 바꾸고 나머지로 새 배송을 만든다.
-async function cancelDelivery(d){
-  const reason=prompt(`배송 ${d.job_id}를 취소할까요?\n목적지 연결이 없는 세대의 물품은 직접 수령으로 바뀌고, 나머지는 다음 배송으로 다시 묶입니다.\n취소 사유 (선택):`,d.error||'');
-  if(reason===null)return;
-  const result=await request(`/api/v1/locker/deliveries/${enc(d.job_id)}/cancel`,'POST',{reason});
-  await pollCargo();renderJobs();
-  notify(result.unroutable.length?`배송을 취소했습니다. 직접 수령 전환 ${result.unroutable.length}건.`:'배송을 취소했습니다.');
-}
-function deliveryRow(tb,d){
-  const p=d.progress||{},children=app.jobs.filter(j=>j.external_owner===d.job_id),open=expandedDeliveries.has(d.job_id);
-  const toggle=button(open?'▾':'▸',()=>{open?expandedDeliveries.delete(d.job_id):expandedDeliveries.add(d.job_id);renderJobs();});
-  toggle.setAttribute('aria-expanded',String(open));toggle.setAttribute('aria-label',`${d.job_id} 하위 작업 ${open?'접기':'펼치기'}`);
-  const title=el('span');title.append(toggle,document.createTextNode(`배송 ${d.job_id} · 보관소`));
-  const progress=el('div',undefined,'delivery-progress'),meter=el('progress');
-  meter.max=p.total||1;meter.value=p.done||0;
-  progress.append(el('span',window.deliveryView.summary(d)),meter);
-  // 묶음 확정 전에는 예상 목록의 세대를 보인다.
-  const households=d.stops?.length?d.stops.map(s=>s.household):[...new Set((d.items||[]).map(i=>`${i.dong}-${i.ho}`))].sort().map(h=>`${h}(예상)`);
-  const route=[d.pickup_name||'픽업',...households,d.return_name||'반납',d.charger||(d.dock_note?null:'충전소')].filter(Boolean).join(' → ');
-  const actions=[button('진행 상세',()=>window.deliveryUI.open(d.job_id))];
-  const child=children.find(j=>j.job_id===d.child_id);
-  if(child&&['assigned','working'].includes(child.status))actions.push(button('현재 단계 취소',async()=>{
-    if(!confirm(`배송 ${d.job_id}의 현재 하위 작업 ${child.job_id}를 취소할까요? 배송은 운영자 확인 필요 상태가 되고 로봇 예약은 유지됩니다.`))return;
-    await request(`${siteURL()}/jobs/${enc(child.job_id)}/cancel`,'POST',{});await refreshSite();
-  }));
-  if(d.phase==='blocked')actions.push(button('적재물 확인·복귀',()=>{location.href='/static/locker.html';}));
-  if(d.phase==='queued'&&!d.robot_id)actions.push(button('배송 취소',()=>run(()=>cancelDelivery(d)),'danger'));
-  const status=window.deliveryView.overall[p.status]||label(d.phase);
-  const tr=row(tb,[title,status,d.robot_id||'—',route,progress,d.error||'—',actions]);
-  if(tr){tr.classList.add('delivery-row');tr.dataset.status=p.status||'';}
-  if(!open)return;
-  for(const j of children){
-    const stage=window.deliveryView.stageName(j,d);
-    const sub=row(tb,[`${j.job_id} · ${stage}`,label(j.status),j.robot_id,j.commands.map(c=>window.jobUI?window.jobUI.describe(c):c.target).join(' → '),`${j.done_commands}/${j.total_commands}`,j.error||j.traffic_waiting||'—',[]]);
-    if(sub)sub.classList.add('delivery-child');
-  }
-  if(!children.length){const sub=row(tb,['하위 작업이 아직 없습니다.','','','','','',[]]);if(sub)sub.classList.add('delivery-child');}
-}
 function renderJobs() {
   const tb=$('#jobRows');
   tb.replaceChildren();
-  const deliveries=app.cargo?.deliveries||[],owners=new Set(deliveries.map(d=>d.job_id));
-  for(const d of [...deliveries].reverse()){
-    if(window.jobUI && !window.jobUI.visible({status:deliveryJobStatus(d)}))continue;
-    deliveryRow(tb,d);
-  }
   for(const j of app.jobs){
-    if(j.external_owner&&owners.has(j.external_owner))continue;   // 배송 행 아래에 묶어 보인다
     if(window.jobUI && !window.jobUI.visible(j))continue;
     if(j.system&&!$('#showSystemJobs').checked)continue;   // 자동 충전·대기 복귀는 접어 둔다
     const actions=[];
-    if(j.status==='pending'&&!j.external_owner){
+    if(j.status==='pending'){
       const choice=el('select');
       choice.setAttribute('aria-label',`${j.job_id}에 배정할 로봇`);
       options(choice,(app.detail?.robots||[]).map(r=>[r.robot_id,r.robot_id]),'로봇 지정');
@@ -377,7 +328,7 @@ function renderJobs() {
       if(!confirm(`${j.job_id} 작업을 취소할까요?`))return;await request(`${siteURL()}/jobs/${enc(j.job_id)}/cancel`,'POST',{
       });await refreshSite();
     }));
-    else if(j.status!=='canceling'&&!j.external_owner)actions.push(button('삭제',async()=>{
+    else if(j.status!=='canceling')actions.push(button('삭제',async()=>{
       if(!confirm(`${j.job_id} 작업을 삭제할까요?`))return;await request(`${siteURL()}/jobs/${enc(j.job_id)}`,'DELETE');await refreshSite();
     },'danger'));
     if(j.status==='pending')actions.push(button('취소',async()=>{await request(`${siteURL()}/jobs/${enc(j.job_id)}/cancel`,'POST',{});await refreshSite();}));
@@ -450,7 +401,7 @@ const canvas=$('#mapCanvas'),ctx=canvas.getContext('2d');
 const view={
   image:null,meta:null,annotations:{
   },version:null,scale:1,tx:0,ty:0,w:0,h:0,hits:[],layers:{
-    robots:true,zones:true,locations:true,docks:true,parcels:true,labels:true
+    robots:true,zones:true,locations:true,docks:true,labels:true
   }
 };
 function clearMap() {
@@ -652,25 +603,6 @@ function draw() {
       kind:'location',data:l,x:p.x,y:p.y,r:15
     });
   }
-  // DROP 완료로 바닥에 내려놓은 물품. 같은 위치의 물품은 ID 목록으로 묶는다 (논리적 하차 결과).
-  if(view.layers.parcels){
-    const spots=new Map();
-    for(const parcel of app.cargo?.parcels||[]){
-      const d=parcel.status==='delivered'&&!parcel.floor_cleared_at?parcel.drop_position:null;
-      if(!d||d.map_id!==app.map)continue;
-      const key=`${d.x.toFixed(2)},${d.y.toFixed(2)}`;
-      if(!spots.has(key))spots.set(key,{pose:d,parcels:[]});
-      spots.get(key).parcels.push(parcel);
-    }
-    for(const spot of spots.values()){
-      const p=point(spot.pose);
-      ctx.save();ctx.fillStyle='#c98a4b';ctx.strokeStyle='#f6d7ad';ctx.lineWidth=1.5;
-      spot.parcels.forEach((_,i)=>{ctx.fillRect(p.x-7+i*5,p.y+10-i*5,12,10);ctx.strokeRect(p.x-7+i*5,p.y+10-i*5,12,10);});
-      ctx.restore();
-      if(view.layers.labels)spot.parcels.forEach((parcel,i)=>text(`${parcel.parcel_id.slice(0,10)}…`,p.x+12,p.y+30+i*14,'#f6d7ad'));
-      view.hits.push({kind:'parcel',data:spot,x:p.x,y:p.y+15,r:14});
-    }
-  }
   const robots=mapRobots();
   for(const r of robots){
     if(!view.layers.robots)break;
@@ -743,7 +675,7 @@ function showObject(hit) {
   box.replaceChildren();
   const d=hit.data;
   app.selection={
-    ...hit,key:hit.kind==='robot'?`robot:${d.robot_id}`:hit.kind==='location'?`location:${d.source}:${d.name}`:hit.kind==='parcel'?`parcel:${d.pose.x},${d.pose.y}`:`zone:${d.zone_id}`
+    ...hit,key:hit.kind==='robot'?`robot:${d.robot_id}`:hit.kind==='location'?`location:${d.source}:${d.name}`:`zone:${d.zone_id}`
   };
   $('#objectInfo').hidden=false;
   $('#objectInfo').classList.toggle('robot-popup',hit.kind==='robot');
@@ -758,11 +690,6 @@ function showObject(hit) {
       dialog.showModal();
       $('#objectInfo').hidden=true;
     }
-  }
-  else if(hit.kind==='parcel'){
-    box.append(el('h3',`바닥 하차 물품 ${d.parcels.length}개`),el('p',`${d.pose.target||''} · ${poseText(d.pose)}`));
-    for(const parcel of d.parcels)box.append(el('p',`${parcel.parcel_id} · ${parcel.source.receipt_no} → ${parcel.household} (${parcel.tray_id})`));
-    box.append(el('p','DROP 완료 보고로 기록한 논리적 하차 위치입니다.','muted'));
   }
   else if(hit.kind==='location'){
     box.append(el('h3',d.name),el('p',types[d.type]||d.type),el('p',`좌표: ${poseText(d.pose)}`),el('p',d.source==='등록'?'관리자가 등록한 목적지':'맵에 포함된 원본 위치'),button(d.source==='등록'?'목적지 편집':'목적지로 가져오기',()=>fillLocation({
@@ -786,7 +713,7 @@ function showObject(hit) {
 function pickupStationInfo(box,station,fromZone) {
   box.append(el('p',`스테이션 ID: ${station.station_id}`));
   if(station.node)box.append(el('p',`⇲ 픽업 지점: ${poseText(station.node)}`));
-  box.append(el('p',station.return_node?`⇱ 반납 지점: ${station.return_name} · ${poseText(station.return_node)}`:'⇱ 반납 지점: 없음 — 배송에 쓸 수 없습니다',station.return_node?undefined:'warn'));
+  box.append(el('p',station.return_node?`⇱ 반납 지점: ${station.return_name} · ${poseText(station.return_node)}`:'⇱ 반납 지점: 없음',station.return_node?undefined:'warn'));
   if(station.status!=='ok'){
     box.append(el('p',`연결 확인 필요: ${station.problems.join(', ')}`,'warn'));
     // 구역이 사라진 손상 스테이션은 구역을 클릭할 수 없으므로 node 쪽에서 정리한다.
@@ -933,32 +860,6 @@ connectStream();
 setInterval(()=>{
   health();run(pollFleet);
 },3000);
-// 물품 장부(트레이·바닥 하차)는 액션 진행에 맞춰 자주 갱신한다.
-let cargoBusy=false;
-async function pollCargo() {
-  if(!app.site||cargoBusy)return;
-  cargoBusy=true;
-  try{
-    const site=app.site,body=await request(`${siteURL()}/cargo`);
-    if(site!==app.site)return;
-    const changed=JSON.stringify(body)!==JSON.stringify(app.cargo);
-    app.cargo=body;
-    if(changed){
-      refreshRobotInfo();draw();window.deliveryUI?.refresh();
-      if(app.page==='jobs')renderJobs();
-    }
-  }finally{cargoBusy=false;}
-}
-setInterval(()=>run(pollCargo),1500);
-// 배송 완료 물품의 바닥 하차 표시 정리 (기록은 남는다). 시연 전·세대가 가져간 뒤.
-document.getElementById('clearFloor').onclick=()=>run(async()=>{
-  if(!app.site)return;
-  const shown=(app.cargo?.parcels||[]).filter(p=>p.status==='delivered'&&p.drop_position&&!p.floor_cleared_at).length;
-  if(!shown){notify('지울 하차 물품 표시가 없습니다.');return;}
-  if(!confirm(`모든 층의 하차 물품 표시 ${shown}개를 지울까요? 배송 기록은 남습니다.`))return;
-  const res=await request(`${siteURL()}/parcels/clear-floor`,'POST',{});
-  await pollCargo();draw();notify(`하차 물품 표시 ${res.count}개를 지웠습니다.`);
-});
 setInterval(()=>{
   if(!app.site||siteBusy)return;siteBusy=true;run(async()=>{
     try{

@@ -4,7 +4,6 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FMS · 실시간 맵</title>
 <link rel="stylesheet" href="/static/fms.css">
-<script src="/static/delivery.js" defer></script>
 <script src="/static/robot-details.js" defer></script>
 <script src="/static/fms.js" defer></script>
 <script src="/static/zone-geometry.js" defer></script>
@@ -26,7 +25,6 @@
     <button data-page="robots"><span>▣</span>로봇</button>
     <button data-page="jobs"><span>≡</span>작업 게시판</button>
     <button data-page="presets"><span>▤</span>작업 프리셋</button>
-    <button type="button" onclick="location.href='/static/locker.html'"><span>▦</span>보관소 배송</button>
     <div class="nav-divider"></div>
     <button data-page="maps"><span>▱</span>맵 관리</button>
     <button data-page="locations"><span>⌖</span>목적지·도킹</button>
@@ -67,7 +65,6 @@
           <label><input type="checkbox" data-layer="zones" checked> 구역</label>
           <label><input type="checkbox" data-layer="locations" checked> 목적지</label>
           <label><input type="checkbox" data-layer="docks" checked> 충전·주차 지점</label>
-          <label><input type="checkbox" data-layer="parcels" checked> 하차 물품 <button type="button" id="clearFloor" class="layer-action" title="배송 완료 물품의 바닥 표시를 모든 층에서 지운다 (기록은 남음)">정리</button></label>
           <label><input type="checkbox" data-layer="labels" checked> 이름</label>
         </div></details></div>
         <div class="zoom-tools"><button id="zoomOut" aria-label="축소">−</button><button id="zoomIn" aria-label="확대">+</button><button id="fitMap">전체 맞춤</button></div>
@@ -96,7 +93,7 @@
           <fieldset id="pickupNodeFields" class="pickup-node" hidden>
             <legend>픽업·반납 지점 (node)</legend>
             <div class="zone-buttons"><button id="pickupStepZone" type="button">구역</button><button id="pickupStepNode" type="button">⇲ 픽업 지점</button><button id="pickupStepReturn" class="return" type="button">⇱ 반납 지점</button></div>
-            <p class="muted pickup-node-note">픽업: 물품 2개를 트레이에 싣는 곳. 반납: 배송 후 빈 트레이를 내려놓는 곳. 두 지점은 1 m 이상 떨어뜨리세요.</p>
+            <p class="muted pickup-node-note">픽업: 물품 2개를 트레이에 싣는 곳. 반납: 빈 트레이를 내려놓는 곳. 두 지점은 1 m 이상 떨어뜨리세요.</p>
             <div class="pickup-node-title">⇲ 픽업 지점</div>
             <div class="zone-dimensions">
               <label>X (m)<input name="nodeX" type="number" step="any"></label>
@@ -242,7 +239,7 @@
     <div class="table-wrap"><table><thead><tr><th>발생</th><th>내용</th><th>상태</th><th>확인</th><th></th></tr></thead><tbody id="alertRows"></tbody></table></div>
   </section>
   <section id="page-stats" class="page content-page" hidden>
-    <div class="page-heading"><div><h2>통계</h2><p>이벤트 로그를 집계한 운영 지표입니다. 자동 충전·대기 복귀 같은 시스템 작업과 배송 하위 작업은 작업 수에서 뺍니다.</p></div>
+    <div class="page-heading"><div><h2>통계</h2><p>이벤트 로그를 집계한 운영 지표입니다. 자동 충전·대기 복귀 같은 시스템 작업은 작업 수에서 뺍니다.</p></div>
       <label>기간<select id="kpiRange"><option value="24h">최근 24시간 (시간별)</option><option value="7d">최근 7일 (일별)</option><option value="30d">최근 30일 (일별)</option></select></label></div>
     <div id="kpiTiles" class="kpi-tiles"></div>
     <div class="panel"><h3>작업 처리</h3><canvas id="kpiJobs" class="kpi-chart"></canvas><div id="kpiJobsKey" class="chart-keys"></div></div>

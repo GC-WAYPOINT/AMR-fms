@@ -129,7 +129,7 @@ window.opsUI = (() => {
       if (value === null || value.trim() === '') return;
       await request(`${siteURL()}/jobs/${enc(j.job_id)}`, 'PATCH', {priority: Number(value)}); await refreshSite();
     }));
-    if (['failed', 'canceled', 'success'].includes(j.status) && !j.external_owner && !j.system) actions.push(button('재시도', async () => {
+    if (['failed', 'canceled', 'success'].includes(j.status) && !j.system) actions.push(button('재시도', async () => {
       const r = await request(`${siteURL()}/jobs/${enc(j.job_id)}/retry`, 'POST', {}); await refreshSite();
       notify(`${r.job_id} 작업을 새로 만들었습니다.`);
     }));

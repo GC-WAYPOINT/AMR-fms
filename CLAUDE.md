@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 개요
 
 AMR 플릿 관리 서버(FMS, Python/FastAPI). 2026-11-08 에 makerton(대회 리포)의 `fms_server/`, `common/` 을 파일 복사로 옮겨 시작했다 (이력 없음).
-로봇 클라이언트(C++)·뷰어·브로커 설정은 형제 폴더 `../AMR-simulator` (public 리포)에 있다. LastGate(보관소 서버·웹)는 makerton 리포에만 있고 여기에는 없다. `locker.py`/`cargo.py` 는 MQTT 로 LastGate 와 연동한다.
+로봇 클라이언트(C++)·뷰어·브로커 설정은 형제 폴더 `../AMR-simulator` (public 리포)에 있다. 택배(LastGate 보관소 배송) 기능은 makerton 리포에만 있고 이 리포에서는 뺐다.
 
 ## 작업 규칙
 
@@ -22,7 +22,7 @@ AMR 플릿 관리 서버(FMS, Python/FastAPI). 2026-11-08 에 makerton(대회 �
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # Python 3.11+
 .venv/bin/uvicorn fms_server.main:app --host 127.0.0.1 --port 8000   # UI: / , API 문서: /docs , 상태: /health
-.venv/bin/python -m pytest fms_server/tests/ -q                      # 전체 (331개, 약 7분)
+.venv/bin/python -m pytest fms_server/tests/ -q                      # 전체 (300개, 약 7분)
 .venv/bin/python -m pytest fms_server/tests/test_task.py -q          # 파일 하나
 .venv/bin/python -m pytest fms_server/tests/test_task.py::test_이름 -q   # 테스트 하나 (-k 패턴도 가능)
 node --test fms_server/tests/zone-geometry.test.js                   # JS 기하 테스트
@@ -39,7 +39,7 @@ node --test fms_server/tests/zone-geometry.test.js                   # JS 기하
 ### 테스트 작성 패턴
 
 - API 테스트: `with TestClient(app) as c:` 로 lifespan 을 띄운 뒤 `app.state.sites = SiteRegistry(tmp_path)` 로 갈아끼운다. lifespan 에서 registry 를 캡처한 객체(`app.state.coordinator._registry`, `app.state.broadcaster._registry` 등)도 같이 바꿔야 한다 (`test_sites_api.py` 의 `client` fixture 참고).
-- 로직 테스트: `JobCoordinator`/`LockerBridge` 를 가짜 `Mqtt` 클래스(발행을 리스트에 모음)와 `tmp_path` 저장소로 직접 만든다 (`test_locker.py` 의 `env` fixture 참고). 로봇 보고는 `tests/factories.py` 의 `make_state`/`make_connection` 을 `fleet.apply_state` 에 넣어 흉내 낸다.
+- 로직 테스트: `JobCoordinator` 를 가짜 `Mqtt` 클래스(발행을 리스트에 모음)와 `tmp_path` 저장소로 직접 만든다 (`test_presets_allocator.py` 의 `env` fixture 참고). 로봇 보고는 `tests/factories.py` 의 `make_state`/`make_connection` 을 `fleet.apply_state` 에 넣어 흉내 낸다.
 
 ## 계약 (가장 주의)
 
@@ -49,29 +49,27 @@ node --test fms_server/tests/zone-geometry.test.js                   # JS 기하
 - MQTT 토픽:
   - 로봇: `fms/v1/{id}/{order,instant,state,connection,factsheet}` (factsheet 는 retained, 선택). 맵은 `SET_MAP` instant action 의 URL 로 번들 zip 을 로봇이 받아간다 (`FMS_PUBLIC_URL`).
   - 승강기: `elev/v1/{elevator_id}/{state,cmd}` (`common/elevator_proto.py`). 내장 시뮬레이터(`FMS_ELEVATOR_SIM=1`, 기본)와 외부 `tools/elevator_sim.py` 가 같은 계약을 쓴다.
-  - LastGate: `locker/robot/{job,bundle,event}` (`locker.py`).
 - 단위: API 의 `theta` 는 라디안, 웹 입력과 구역 `rotation` 은 도(°).
 
 ## 구조
 
 세부는 [docs/architecture.md](docs/architecture.md), 기능별로 [docs/traffic.md](docs/traffic.md)·[docs/elevators.md](docs/elevators.md)·[docs/pickup-station.md](docs/pickup-station.md), 제약은 [docs/known-issues.md](docs/known-issues.md), 미구현 기능 계획은 [docs/roadmap.md](docs/roadmap.md). 요약:
 
-- `main.py` lifespan: 저장소·MQTT·맵 코디네이터·작업 코디네이터·승강기 제어기/내장 시뮬레이터·배정 루프·보관소 연동을 만들어 `app.state` 에 싣는다. `api/` 라우터는 전역 객체 대신 `request.app.state.*` 로 꺼내 쓴다.
+- `main.py` lifespan: 저장소·MQTT·맵 코디네이터·작업 코디네이터·승강기 제어기/내장 시뮬레이터·배정 루프를 만들어 `app.state` 에 싣는다. `api/` 라우터는 전역 객체 대신 `request.app.state.*` 로 꺼내 쓴다.
 - `task.py`(작업 상태·Order·다층 stage), `route.py`(층간 계획), `allocator.py`(1초 배정), `traffic.py`(맵별 정원·점유 존 예약, `traffic.json`).
 - `mapkit/`: `store.py` 버전 저장, `ingest.py` 검증, `bake.py` 주행금지 굽기, `chargers.py`.
 - `events.py`(이벤트 로그 `events.db`) 위에 `robot_events.py`·`kpi.py`·`alerts.py`·`webhooks.py`. `auth.py`(API 키, 기본 꺼짐).
 - `assign.py`(로봇 비용 순위), `battery.py`·`charger_pool.py`(자동 충전·대기 복귀, 기본 꺼짐), `scheduler.py`(예약 실행), `api/ops.py`(현장 정지·대피). 사용법은 [docs/operations.md](docs/operations.md)·[docs/charging.md](docs/charging.md).
-- `locker.py`(LastGate 배송 흐름) -> `cargo.py`(물품·묶음·트레이 장부 `cargo.json`) -> `delivery_progress.py`(진행 표시 계산, 상태 저장 없음).
 - 웹 UI 는 `static/` 의 순수 HTML/JS (빌드·CDN 없음). `tests/zone-geometry.test.js` 는 node 로 돈다.
 - 영속 데이터는 전부 `FMS_DATA_ROOT`(기본 `fms_server/maps/`, gitignore) 아래 JSON 파일이다. 배치는 `fms_server/README.md` "저장 구조" 참고.
 
 ### 스레드와 락
 
-- 스레드: paho 네트워크 스레드(State 수신 -> `Fleet` 리스너 호출), asyncio 루프(REST/WebSocket), `job-allocator`(1초), `locker-bridge`(0.25초 tick), `elevator-sim`, `event-log`(이벤트 commit·구독자 호출), `webhooks`(전송).
+- 스레드: paho 네트워크 스레드(State 수신 -> `Fleet` 리스너 호출), asyncio 루프(REST/WebSocket), `job-allocator`(1초), `elevator-sim`, `event-log`(이벤트 commit·구독자 호출), `webhooks`(전송).
 - 새 주기 로직은 스레드를 만들지 않고 `allocator.py` 1초 루프의 tick 목록에 얹는다 (로봇 이벤트·교통 안전·배터리·예약 실행·알림).
 - `EventLog.record()` 는 큐에 넣기만 한다. 어느 스레드·락 안에서 불러도 된다. 구독자(`add_listener`)는 `event-log` 스레드에서 불리므로 거기서 코디네이터 락을 잡고 오래 일하지 않는다.
-- `Fleet` 리스너는 paho 스레드에서 불린다. 그 안에서 블로킹하거나 asyncio 객체를 직접 만지지 않는다 (`api/broadcaster.py` 처럼 `call_soon_threadsafe` 로 넘긴다). `locker.py` 도 MQTT 콜백에서는 큐에 넣기만 하고 워커 스레드에서 처리한다.
-- 작업 상태 변경(배정·취소·진행·교통·배송 전이)은 모두 `JobCoordinator.lock`(RLock) 안에서 한다. `traffic.py` 의 호출도 이 락을 전제로 한다.
+- `Fleet` 리스너는 paho 스레드에서 불린다. 그 안에서 블로킹하거나 asyncio 객체를 직접 만지지 않는다 (`api/broadcaster.py` 처럼 `call_soon_threadsafe` 로 넘긴다).
+- 작업 상태 변경(배정·취소·진행·교통 전이)은 모두 `JobCoordinator.lock`(RLock) 안에서 한다. `traffic.py` 의 호출도 이 락을 전제로 한다.
 - 락 순서: `JobCoordinator.lock -> _EDIT_LOCK -> LocationStore._lock`. 거꾸로 잡지 않는다.
 
 ### 헷갈리기 쉬운 개념

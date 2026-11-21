@@ -60,17 +60,10 @@ def _stores(request, site_id):
     return registry.map_store(site_id), registry.location_store(site_id)
 
 
-def _reference_checker(request, site_id, statuses, station_id):
+def _reference_checker(request, site_id, statuses):
     presets = request.app.state.presets.list(site_id)
     jobs = request.app.state.jobs.list(site_id)
-    locker = getattr(request.app.state, 'locker', None)
-    config = locker.snapshot()['config'] if locker is not None else None
-    cargo = getattr(request.app.state, 'cargo', None)
-    parcels = cargo.active_for_station(station_id) if cargo is not None else []
-    return lambda name: describe_references(
-        name, presets=presets, jobs=jobs,
-        locker_config=config if config and config.get('site_id') == site_id else None,
-        statuses=statuses, station_id=station_id, active_parcels=parcels)
+    return lambda name: describe_references(name, presets=presets, jobs=jobs, statuses=statuses)
 
 
 def _call(request, site_id, map_id, fn):
@@ -127,7 +120,7 @@ def update_pickup_station(site_id: str, map_id: str, station_id: str,
                                   Rect(**body.zone.model_dump()), body.node.x, body.node.y,
                                   body.node.theta, body.return_node.x, body.return_node.y,
                                   body.return_node.theta,
-                                  node_locked=_reference_checker(request, site_id, ACTIVE_JOB_STATUSES, station_id))
+                                  node_locked=_reference_checker(request, site_id, ACTIVE_JOB_STATUSES))
     return _call(request, site_id, map_id, run)
 
 
@@ -138,5 +131,5 @@ def delete_pickup_station(site_id: str, map_id: str, station_id: str, base_versi
         maps, locations = _stores(request, site_id)
         with request.app.state.job_coordinator.lock:
             return delete_station(maps, locations, map_id, station_id, base_version,
-                                  in_use=_reference_checker(request, site_id, OPEN_JOB_STATUSES, station_id))
+                                  in_use=_reference_checker(request, site_id, OPEN_JOB_STATUSES))
     return _call(request, site_id, map_id, run)

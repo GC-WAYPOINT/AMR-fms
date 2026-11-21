@@ -198,6 +198,3 @@ def test_retry_creates_new_pending_job(env):
     new = jobs.get(r.json()["job_id"])
     assert new.retry_of == job_id and new.status == JobStatus.PENDING and new.auto_assign
     assert new.priority == 5 and [x.to_dict() for x in new.commands] == [x.to_dict() for x in jobs.get(job_id).commands]
-    child = jobs.create("hq", [{"type": "move", "target": "a1"}], external_owner="locker-1")
-    coord.cancel(child.job_id)
-    assert c.post(BASE + f"/jobs/{child.job_id}/retry").status_code == 409  # 배송은 보관소 복귀 절차

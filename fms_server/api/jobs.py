@@ -68,7 +68,6 @@ class JobOut(BaseModel):
     commands: list[dict]
     auto_assign: bool = False
     preset_name: str | None = None
-    external_owner: str | None = None
     order_id: str | None
     order_update_id: int
     done_commands: int
@@ -99,7 +98,6 @@ class JobOut(BaseModel):
             robot_id=job.robot_id,
             commands=[c.to_dict() for c in job.commands],
             auto_assign=job.auto_assign, preset_name=job.preset_name,
-            external_owner=job.external_owner,
             order_id=job.order_id,
             order_update_id=job.order_update_id,
             done_commands=job.done_commands,
@@ -199,8 +197,6 @@ def retry_job(site_id: str, job_id: str, request: Request) -> JobOut:
     from fms_server.task import _parse_command, resolve_steps
     with _coordinator(request).lock:
         job = _job_in_site(request, site_id, job_id)
-        if job.external_owner:
-            raise HTTPException(status_code=409, detail="배송 하위 작업은 보관소 복귀 절차로 처리한다")
         if job.system:
             raise HTTPException(status_code=409, detail="시스템 작업은 재시도하지 않는다 (조건이 되면 다시 만들어진다)")
         if not job.status.terminal:
@@ -233,8 +229,6 @@ def get_job(site_id: str, job_id: str, request: Request) -> JobOut:
 @router.post("/{job_id}/dispatch", response_model=JobOut)
 def dispatch_job(site_id: str, job_id: str, body: DispatchRequest, request: Request) -> JobOut:
     job = _job_in_site(request, site_id, job_id)
-    if job.external_owner:
-        raise HTTPException(status_code=409, detail="배송 하위 작업은 보관소 연동이 배정한다")
     blocked = request.app.state.sites.get_site(site_id).allocation_blocked
     if blocked:
         raise HTTPException(status_code=409, detail=f"{blocked} — 작업을 배정할 수 없다")
@@ -261,8 +255,6 @@ def cancel_job(site_id: str, job_id: str, request: Request) -> JobOut:
 @router.delete("/{job_id}")
 def delete_job(site_id: str, job_id: str, request: Request):
     job = _job_in_site(request, site_id, job_id)
-    if job.external_owner:
-        raise HTTPException(status_code=409, detail="배송 이력은 삭제할 수 없다")
     try:
         _coordinator(request).delete(job_id)
     except JobError as exc:

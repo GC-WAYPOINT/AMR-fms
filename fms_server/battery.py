@@ -153,11 +153,10 @@ class BatteryManager:
         # 로봇이 지정된 pending 작업(수동 배정 대기)이 있으면 건드리지 않는다.
         active |= {j.robot_id for j in self.jobs.list(site.site_id)
                    if j.robot_id and j.status == JobStatus.PENDING}
-        reserved = set(getattr(self.coordinator, "_reservations", {}))
         out = []
         for record in self.fleet.available_robots():
             assignment = site.robots.get(record.robot_id)
-            if (assignment is None or record.robot_id in active or record.robot_id in reserved):
+            if (assignment is None or record.robot_id in active):
                 continue
             out.append((record, assignment))
         return sorted(out, key=lambda pair: pair[0].robot_id)
