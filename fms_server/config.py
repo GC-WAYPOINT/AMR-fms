@@ -61,6 +61,17 @@ class Settings:
     # 가상 엘리베이터를 FMS 안에서 돌린다 (기본 켜짐). 실제 제어기나 외부 tools/elevator_sim.py 를 쓸 때만 0.
     elevator_sim: bool = True
 
+    # 가상 자동문을 FMS 안에서 돌린다 (기본 켜짐). 실제 문 제어기를 쓸 때만 0.
+    door_sim: bool = True
+
+    # 맵 전역 장애물 레지스트리 ([docs/traffic.md] "막힌 통로 우회"). 로봇이 보고한 정지 장애물을 맵 단위로 모아
+    # 두고 경로 선택에 반영한다.
+    obstacle_ttl: float = 300.0         # 등록 유지 시간 (초). 다시 보고되면 연장한다
+    obstacle_confirm: float = 30.0      # 같은 자리에서 이 시간(초) 계속 보여야 등록한다 (움직이는 장애물 제외)
+    obstacle_view_range: float = 1.0    # 로봇이 이 거리 안인데 장애물이 안 보이면 치워진 것으로 본다 (m)
+    reroute_wait: float = 15.0          # 장애물 때문에 이 시간(초) 서 있으면 재경로를 시도한다
+    reroute_max: int = 3                # 작업 하나당 재경로 최대 횟수
+
     # 이벤트 로그(events.db) 보존 기간 (일). 0 이하면 지우지 않는다.
     event_retention_days: float = 30.0
 
@@ -81,6 +92,12 @@ class Settings:
             robot_stale_after=_env_float("FMS_ROBOT_STALE_AFTER", cls.robot_stale_after),
             mqtt_required=_env_str("FMS_MQTT_REQUIRED", "0") not in ("0", "", "false", "False"),
             elevator_sim=_env_str("FMS_ELEVATOR_SIM", "1") not in ("0", "false", "False", "no", "off"),
+            door_sim=_env_str("FMS_DOOR_SIM", "1") not in ("0", "false", "False", "no", "off"),
+            obstacle_ttl=_env_float("FMS_OBSTACLE_TTL", cls.obstacle_ttl),
+            obstacle_confirm=_env_float("FMS_OBSTACLE_CONFIRM", cls.obstacle_confirm),
+            obstacle_view_range=_env_float("FMS_OBSTACLE_VIEW_RANGE", cls.obstacle_view_range),
+            reroute_wait=_env_float("FMS_REROUTE_WAIT", cls.reroute_wait),
+            reroute_max=_env_int("FMS_REROUTE_MAX", cls.reroute_max),
             event_retention_days=_env_float("FMS_EVENT_RETENTION_DAYS", cls.event_retention_days),
             auth=_env_str("FMS_AUTH", "0") not in ("0", "", "false", "False", "no", "off"),
             admin_key=_env_str("FMS_ADMIN_KEY", ""),

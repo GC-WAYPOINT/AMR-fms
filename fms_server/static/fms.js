@@ -129,9 +129,34 @@ function showPage(page) {
   $('#pageTitle').textContent=titles[page];
   document.title=`FMS · ${titles[page]}`;
   if(location.hash!==`#${page}`)history.replaceState(null,'',`#${page}`);
+  closeSidebar(true);
   if(page==='map')resize();
   window.observeUI?.pageShown(page);
 }
+const sidebar=$('#sidebar');
+const sidebarBackdrop=$('#sidebarBackdrop');
+const menuToggle=$('#menuToggle');
+function setSidebar(open) {
+  document.body.classList.toggle('nav-open',open);
+  sidebar.setAttribute('aria-hidden',String(!open));
+  menuToggle.setAttribute('aria-expanded',String(open));
+  menuToggle.setAttribute('aria-label',open?'메뉴 닫기':'메뉴 열기');
+  sidebarBackdrop.hidden=!open;
+  if(open)sidebar.querySelector('[aria-current="page"]')?.focus();
+}
+function closeSidebar(returnFocus=false) {
+  const wasOpen=document.body.classList.contains('nav-open');
+  setSidebar(false);
+  if(wasOpen&&returnFocus)menuToggle.focus();
+}
+menuToggle.onclick=()=>setSidebar(!document.body.classList.contains('nav-open'));
+sidebarBackdrop.onclick=()=>closeSidebar(true);
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&document.body.classList.contains('nav-open')){
+    closeSidebar();
+    menuToggle.focus();
+  }
+});
 for(const b of document.querySelectorAll('[data-page],[data-goto]'))b.onclick=()=>showPage(b.dataset.page||b.dataset.goto);
 window.addEventListener('hashchange',()=>showPage(location.hash.slice(1)));
 $('#notice button').onclick=()=>$('#notice').hidden=true;
@@ -266,7 +291,7 @@ function renderRobots() {
   options($('#jobRobot'),(app.detail?.robots||[]).map(r=>[r.robot_id,r.robot_id]),'로봇 선택');
 }
 function poseText(p) {
-  return `${Number(p.x).toFixed(2)} / ${Number(p.y).toFixed(2)} / ${Number(p.theta||0).toFixed(2)}`;
+  return `${Number(p.x).toFixed(3)} / ${Number(p.y).toFixed(3)} / ${Number(p.theta||0).toFixed(3)}`;
 }
 function renderLocations() {
   const tb=$('#locationRows');
@@ -290,7 +315,10 @@ function renderAnnotations() {
 function fillLocation(l,edit) {
   resetEdit();
   const f=$('#locForm');
-  for(const k of ['name','map_id','x','y','theta','type'])f.elements.namedItem(k).value=l[k]??0;
+  for(const k of ['name','map_id','x','y','theta','type']){
+    const value=l[k]??0;
+    f.elements.namedItem(k).value=['x','y','theta'].includes(k)&&Number.isFinite(Number(value))?Number(Number(value).toFixed(3)):value;
+  }
   app.edit=edit?l.name:null;
   f.elements.name.readOnly=false;
   $('#locFormTitle').textContent=edit?'목적지 편집':'맵 위치 가져오기';
@@ -401,7 +429,7 @@ const canvas=$('#mapCanvas'),ctx=canvas.getContext('2d');
 const view={
   image:null,meta:null,annotations:{
   },version:null,scale:1,tx:0,ty:0,w:0,h:0,hits:[],layers:{
-    robots:true,zones:true,locations:true,docks:true,labels:true
+    robots:true,zones:true,obstacles:true,locations:true,docks:true,labels:true
   }
 };
 function clearMap() {
@@ -517,6 +545,40 @@ function text(t,x,y,color='#dbe7f5') {
   ctx.fillStyle=color;
   ctx.fillText(t,x,y);
 }
+// 맵 전역 장애물: 로봇이 보고한 정지 장애물을 FMS 가 일정 시간 기억한다 (traffic.obstacles). 가까운 칸끼리 묶어 남은 시간을 보인다.
+function obstacleRemaining(o) {
+  const tv=window.trafficView;
+  return Math.max(0,o.expires_in-(Date.now()-(tv?.fetchedAt||Date.now()))/1000);
+}
+function obstacleClusters(list) {
+  const groups=[];
+  for(const o of list){
+    const near=groups.filter(g=>g.items.some(q=>Math.hypot(q.x-o.x,q.y-o.y)<=.25));
+    const merged={items:[o]};
+    for(const g of near){merged.items.push(...g.items);groups.splice(groups.indexOf(g),1);}
+    groups.push(merged);
+  }
+  return groups;
+}
+function drawObstacles() {
+  if(!view.layers.obstacles)return;
+  const list=window.trafficView?.snapshot?.obstacles||[];
+  if(!list.length)return;
+  const res=view.meta.resolution;
+  ctx.save();
+  for(const o of list){
+    const a=point({x:o.x-o.width/2,y:o.y-o.height/2}),w=Math.max(4,o.width/res*view.scale),h=Math.max(4,o.height/res*view.scale);
+    ctx.fillStyle='#ff9f4338';ctx.fillRect(a.x,a.y,w,h);
+    ctx.strokeStyle='#ff9f43';ctx.lineWidth=1.5;ctx.setLineDash([3,2]);ctx.strokeRect(a.x,a.y,w,h);
+  }
+  ctx.setLineDash([]);
+  for(const g of obstacleClusters(list)){
+    const left=Math.min(...g.items.map(o=>point({x:o.x-o.width/2,y:0}).x)),top=Math.min(...g.items.map(o=>point({x:0,y:o.y-o.height/2}).y));
+    const sec=Math.min(...g.items.map(obstacleRemaining)),m=Math.floor(sec/60),s=String(Math.floor(sec%60)).padStart(2,'0');
+    text(`장애물 ${g.items.length>1?g.items.length+'칸 · ':''}${m}:${s}`,left,top-6,sec<30?'#ff6b6b':'#ffb870');
+  }
+  ctx.restore();
+}
 function draw() {
   ctx.clearRect(0,0,view.w,view.h);
   if(!view.image||!view.meta)return;
@@ -541,7 +603,14 @@ function draw() {
       kind:'zone',data:z,pts
     });
     if(z.type==='occupancy'){
-      for(const g of z.gates||[])for(const [pose,title] of [[g.wait,'대기'],[g.exit,'출구']]){
+      if(z.door){
+        // 자동문: 양쪽 진입점만 그린다 (방향별 대기·출구는 이 둘에서 파생)
+        for(const [pose,title] of [[z.door.node_a,'문 A'],[z.door.node_b,'문 B']]){
+          const p=point(pose);ctx.beginPath();ctx.arc(p.x,p.y,5,0,Math.PI*2);ctx.stroke();
+          if(view.layers.labels)text(title,p.x+7,p.y-7,color);
+        }
+        if(view.layers.labels&&traffic?.door?.door)text(`문 ${traffic.door.door}`,pts[0].x+6,pts[0].y+46,color);
+      }else for(const g of z.gates||[])for(const [pose,title] of [[g.wait,'대기'],[g.exit,'출구']]){
         const p=point(pose);ctx.beginPath();ctx.arc(p.x,p.y,5,0,Math.PI*2);ctx.stroke();
         if(view.layers.labels)text(title,p.x+7,p.y-7,color);
       }
@@ -559,6 +628,7 @@ function draw() {
     }
     if(view.layers.labels&&view.scale/view.meta.resolution>12)text(station?.name||z.name||label(z.type),pts[0].x+6,pts[0].y+16,color);
   }
+  drawObstacles();
   const locs=[...(view.annotations.locations||[]).map(l=>({
     ...l,source:'맵',pose:l.pose
   })),...app.locations.filter(l=>l.map_id===app.map).map(l=>({
@@ -702,7 +772,7 @@ function showObject(hit) {
     const station=d.type==='pickup'?app.pickupStations.find(s=>s.station_id===d.zone_id):null;
     box.append(el('h3',station?.name||d.name||'이름 없는 구역'),el('p',({
       prohibit:'주행금지구역 (Forbidden zone)',elevator:'엘리베이터 구역 · 위치 표시용',slow:'감속 구역 · 구역 안 속도 제한',oneway:'일방통행 구역 · 표시 전용',
-      occupancy:'점유 존 · 한 대씩 통과',
+      occupancy:d.door?`자동문 · 문 ID ${d.door.door_id} · 한 대씩 통과`:'점유 존 · 한 대씩 통과',
       pickup:'픽업스테이션 구역 · 적재 장치 위치 표시용 (주행을 막지 않음)'
     })[d.type]||d.type));
     if(station)pickupStationInfo(box,station,true);

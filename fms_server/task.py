@@ -233,6 +233,8 @@ class Job:
     system: Optional[str] = None         # 시스템 작업: "charge" | "staging" | "evacuation" | "recover"
     retry_of: Optional[str] = None       # 재시도 원본 job_id
     external_id: Optional[str] = None    # 외부 주문 멱등 키
+    reroutes: int = 0                    # 막힌 통로 때문에 오더를 다시 만든 횟수 (order_id 접미사 -rN)
+    resume_from: int = 0                 # 재경로 뒤 오더가 이어받는 첫 명령 번호 (앞 명령은 이미 끝났다)
 
     def touch(self) -> None:
         self.updated_at = _now_iso()
@@ -258,6 +260,7 @@ class Job:
             "priority": self.priority, "not_before": self.not_before, "deadline": self.deadline,
             "deadline_missed": self.deadline_missed, "robot_group": self.robot_group,
             "system": self.system, "retry_of": self.retry_of, "external_id": self.external_id,
+            "reroutes": self.reroutes, "resume_from": self.resume_from,
         }
 
     @classmethod
@@ -284,6 +287,7 @@ class Job:
             deadline=data.get("deadline"), deadline_missed=bool(data.get("deadline_missed", False)),
             robot_group=data.get("robot_group"), system=data.get("system"),
             retry_of=data.get("retry_of"), external_id=data.get("external_id"),
+            reroutes=int(data.get("reroutes", 0)), resume_from=int(data.get("resume_from", 0)),
         )
 
 
@@ -455,6 +459,8 @@ def compile_to_order(job: Job, registry: SiteRegistry) -> Order:
     order_id = job.order_id or job.job_id
     nodes = []
     for i, (command, step) in enumerate(zip(job.commands, resolved, strict=True)):
+        if i < job.resume_from:
+            continue   # 재경로: 이미 끝낸 명령은 새 오더에 넣지 않는다
         action = None
         if isinstance(command, ActionCommand):
             kind = {"wait": ActionType.WAIT, "docking": ActionType.DOCK, "parking": ActionType.PARK,
@@ -466,7 +472,7 @@ def compile_to_order(job: Job, registry: SiteRegistry) -> Order:
                 from fms_server.mapkit.chargers import require_charger
                 require_charger(registry.map_store(job.site_id), target_map,
                                 Pose(**step["pose"]), command.params["entry"])
-        nodes.append(OrderNode(node_id=f"{order_id}-n{i}", sequence_id=i,
+        nodes.append(OrderNode(node_id=f"{order_id}-n{i}", sequence_id=len(nodes),
                                released=True, position=Pose(**step["pose"]), action=action))
 
     return Order(
@@ -508,6 +514,7 @@ class JobCoordinator:
         *,
         elevators=None,          # ElevatorStore 또는 그걸 돌려주는 callable (다층 job 용)
         elevator_ctl=None,       # ElevatorController (다층 job 용)
+        door_ctl=None,           # DoorController (자동문 존 통과용)
         site_coordinator=None,   # SiteCoordinator: 층을 옮긴 로봇에 바로 SET_MAP 을 보낸다 (없으면 다음 state 때)
         events=None,             # EventLog (없으면 기록하지 않는다)
     ) -> None:
@@ -517,13 +524,14 @@ class JobCoordinator:
         self._mqtt = mqtt
         self._elevators_src = elevators
         self._ctl = elevator_ctl
+        self._door_ctl = door_ctl
         self._site_coordinator = site_coordinator
         self._events = events
         self.battery = None      # BatteryManager: 충전 정책(min_job_charge)·비켜주기. 없으면 이전 동작
         self._unsubscribe = None
         self._lock = threading.RLock()
         from fms_server.traffic import TrafficController
-        self._traffic = TrafficController(registry, fleet, store, events=events)
+        self._traffic = TrafficController(registry, fleet, store, events=events, doors=door_ctl)
 
     @property
     def events(self):
@@ -554,7 +562,8 @@ class JobCoordinator:
         if (self._traffic.registry is not self._registry or self._traffic.fleet is not self._fleet
                 or self._traffic.jobs is not self._store):
             from fms_server.traffic import TrafficController
-            self._traffic = TrafficController(self._registry, self._fleet, self._store, events=self._events)
+            self._traffic = TrafficController(self._registry, self._fleet, self._store, events=self._events,
+                                            doors=self._door_ctl)
         return self._traffic
 
     @property
@@ -672,10 +681,11 @@ class JobCoordinator:
 
         previous_robot = job.robot_id
         job.robot_id = target_robot
-        job.order_id = job.job_id
+        # 막힌 통로로 오더를 다시 만들 때는 order_id 를 바꾼다 (같은 id 를 다시 보내면 로봇이 끝난 오더로 무시한다).
+        job.order_id = f"{job.job_id}-r{job.reroutes}" if job.reroutes else job.job_id
         job.order_update_id = 1
         job.acknowledged = False
-        job.done_commands = 0
+        job.done_commands = job.resume_from
         job.error = None
 
         try:
@@ -1294,6 +1304,8 @@ class JobCoordinator:
         now = time.time() if now is None else now
         traffic = self.traffic
         analysis = traffic.analyze(now, self._ctl)
+        traffic.obstacles.update(now)
+        self.tick_reroute(now)
         if analysis["deadlocks"]:
             traffic.revoke_safe(analysis)
         # 길을 막고 선 유휴 로봇을 대기 위치로 보낸다 (자동 충전·대기 관리자가 있을 때만).
@@ -1374,6 +1386,8 @@ class JobCoordinator:
         for job in sorted(self._store.list(), key=lambda j: (j.dispatched_at or j.created_at, j.job_id)):
             if not job.traffic or job.status not in (JobStatus.ASSIGNED, JobStatus.WORKING):
                 continue
+            if job.traffic.get("rerouting"):
+                continue   # 취소하고 다시 보내는 중이다. 낡은 오더에 허가를 더 내보내지 않는다
             if job.plan and (job.stage >= len(job.plan) or job.plan[job.stage]['t'] != 'order'):
                 continue
             order = self.traffic.update(job)
@@ -1387,6 +1401,112 @@ class JobCoordinator:
                     job.error = f"통행 허가 전송 확인 필요: {exc}"
                     self._store.save(job)
 
+    # -- 막힌 통로 재경로 -----------------------------------------------
+
+    @_serialized
+    def tick_reroute(self, now: Optional[float] = None) -> None:
+        """장애물에 막혀 서 있는 작업이 맵 전역 장애물을 피하는 다른 통로(자동문 등)로 갈 수 있으면 오더를 다시 만든다.
+
+        로봇은 한 노드 구간 안에서만 우회하고 허가 없는 점유 존(자동문)은 벽으로 본다. 문을 지나는 길은 오더에
+        진입·통과 노드 쌍을 넣어야 열리므로, FMS 가 장애물을 반영해 경로를 다시 고르고 오더를 취소 후 재전송한다.
+        """
+        now = time.time() if now is None else now
+        if not getattr(self._mqtt, "connected", True):
+            return
+        from fms_server.config import settings
+        traffic = self.traffic
+        for job in self._store.list():
+            if job.status != JobStatus.WORKING or job.plan or not job.robot_id or not job.traffic:
+                continue
+            if job.traffic.get("rerouting") or job.reroutes >= settings.reroute_max:
+                continue
+            record = self._fleet.get(job.robot_id)
+            if not traffic.fresh(record):
+                continue
+            s = record.state
+            if (s.order_id != job.order_id or s.paused or s.state != RobotState.BUSY
+                    or s.sub_state is None or s.sub_state.value != "WAITING"
+                    or any(a.status == ActionStatus.RUNNING for a in s.action_states)):
+                continue
+            # 허가된 노드가 남아 있는데 서 있다 = FMS 가 세운 게 아니라 장애물에 막힌 것이다.
+            if not any(n.released for n in s.node_states):
+                continue
+            motion = traffic._motion.get(job.robot_id)
+            if not motion or not motion.get("waiting_since") or now - motion["waiting_since"] < settings.reroute_wait:
+                continue
+            if any(v["job"] == job.job_id and v["kind"] == "zone" for v in traffic.data["leases"].values()):
+                continue   # 존 안에 있거나 진입 허가를 받았다. 퇴장 증거 없이 오더를 바꾸지 않는다
+            if not traffic.obstacles.rects(job.site_id, job.traffic.get("map_id")):
+                continue   # 등록된 장애물이 없으면 판단할 것이 없다 (등록되면 바로 판단하도록 쿨다운도 쓰지 않는다)
+            if now - traffic.reroute_tried.get(job.job_id, 0) < 60.0:
+                continue
+            traffic.reroute_tried[job.job_id] = now
+            try:
+                self._try_reroute(job, s, now)
+            except Exception:
+                log.exception("재경로 판단 실패 %s", job.job_id)
+
+    def _try_reroute(self, job: Job, state: State, now: float) -> None:
+        assignment = self._registry.assignment_for(job.robot_id)
+        if assignment is None:
+            return
+        resolved = job.resolved_steps or resolve_steps(job.commands, job.site_id, self._registry)
+        # 남은 명령: 로봇이 보고한 "아직 도달하지 않은 노드" 중 원래 명령에 해당하는 것의 첫 번호부터.
+        sources = job.traffic.get("sources", {})
+        remaining = [job.resume_from + sources[n.node_id] for n in state.node_states if n.node_id in sources]
+        if not remaining:
+            return
+        done = min(remaining)
+        positions = [Pose(**step["pose"]) for step in resolved[done:]]
+        try:
+            gates = self.traffic.preview_gates(job, assignment.map_id, state, positions, with_obstacles=True)
+        except Exception as exc:   # 존 안에서 출발하는 경우 등 — 지금은 바꾸지 않는다
+            log.info("재경로 판단 보류 %s: %s", job.job_id, exc)
+            return
+        current = [(c["zone"], c["gate"]) for c in job.traffic.get("crossings", []) if not c["done"]]
+        if gates == current:
+            return   # 장애물을 피하는 다른 통로가 없다. 로봇이 스스로 기다리거나 돌아가거나 장애물이 풀리길 기다린다
+        job.traffic["rerouting"] = {"at": now, "from": done, "gates": [list(g) for g in gates]}
+        self._store.save(job)
+        send_instant(self._mqtt, job.robot_id, InstantActionType.CANCEL_ORDER)
+        log.info("재경로: %s 현재 %s -> %s", job.job_id, current, gates)
+        self._event("traffic.reroute", job, "warning",
+                    reason="맵 전역 장애물에 막힘 — 다른 통로로 오더를 다시 만든다",
+                    from_gates=[list(g) for g in current], to_gates=[list(g) for g in gates],
+                    obstacles=len(self.traffic.obstacles.rects(job.site_id, assignment.map_id)))
+
+    def _continue_reroute(self, job: Job, state: State) -> None:
+        """취소가 확인되면 같은 작업을 새 order_id 로 다시 보낸다. 취소가 안 먹으면 포기하고 원래 오더를 이어 간다."""
+        rr = job.traffic["rerouting"]
+        now = time.time()
+        if (state.order_id is None and state.timestamp >= rr["at"] and abs(state.velocity) < 0.01
+                and state.state in (RobotState.IDLE, RobotState.CHARGING)):
+            if now - rr["at"] > 90.0:
+                job.traffic.pop("rerouting", None)
+                self._finish(job, JobStatus.FAILED, "재경로 오더를 보내지 못했다")
+                return
+            self._reissue(job, rr)
+        elif now - rr["at"] > 30.0 and state.order_id == job.order_id:
+            job.traffic.pop("rerouting", None)
+            self._store.save(job)
+            self._event("traffic.reroute_abort", job, "warning", reason="오더 취소가 확인되지 않아 원래 오더를 유지한다")
+
+    def _reissue(self, job: Job, rr: dict) -> None:
+        saved = (job.order_id, job.done_commands, job.reroutes, job.resume_from, job.status)
+        leases = self.traffic.data["leases"]
+        # 낡은 오더의 대기 node 예약은 새 오더가 다시 잡는다. 점유 존 예약은 이 지점에 오기 전에 걸러진다.
+        for key in [k for k, v in leases.items() if v["job"] == job.job_id and v["kind"] == "wait"]:
+            del leases[key]
+        self.traffic.save()
+        job.resume_from, job.reroutes, job.status = rr["from"], job.reroutes + 1, JobStatus.PENDING
+        try:
+            self.dispatch(job.job_id, job.robot_id)
+        except JobError as exc:
+            job.order_id, job.done_commands, job.reroutes, job.resume_from, job.status = saved
+            log.debug("재경로 재전송 대기 %s: %s", job.job_id, exc)   # 다음 State 에서 다시 시도한다
+            return
+        self._event("traffic.reroute_done", job, order_id=job.order_id, resume_from=job.resume_from)
+
     def _advance(self, job: Job, state: Optional[State]) -> None:
         if state is None:
             return
@@ -1397,6 +1517,11 @@ class JobCoordinator:
                     and state.state in (RobotState.IDLE, RobotState.CHARGING)):
                 self._finish(job, JobStatus.CANCELED, None)
             return
+
+        if job.traffic.get("rerouting"):
+            self._continue_reroute(job, state)
+            if job.traffic.get("rerouting"):
+                return
 
         fatal = [e for e in state.errors if e.level == ErrorLevel.FATAL]
         if fatal:
@@ -1411,18 +1536,21 @@ class JobCoordinator:
             done = 0
             action_status = {a.action_id: a.status for a in state.action_states}
             nodes = (job.order_snapshot or {}).get("nodes", [])
+            # 새 오더의 첫 노드에 닿기 전에는 last_node_* 가 이전 오더의 값이다. 이번 오더의 노드일 때만 번호를 비교한다.
+            reached_any = state.last_node_id in {n["node_id"] for n in nodes}
             for node in nodes:
                 if node.get("action"):
                     if action_status.get(node["action"]["action_id"]) != ActionStatus.FINISHED:
                         break
                 elif not (state.last_node_id == node["node_id"] or
-                          state.last_node_sequence_id > node["sequence_id"]):
+                          (reached_any and state.last_node_sequence_id > node["sequence_id"])):
                     break
                 if not job.traffic or node["node_id"] in job.traffic["sources"]:
                     done += 1
             if first_ack:
                 self._store.save(job)
                 self._event("job.working", job)
+            done += job.resume_from
             if done != job.done_commands:
                 job.done_commands = done
                 job.touch()

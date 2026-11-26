@@ -15,7 +15,7 @@ window.observeUI = (() => {
     const pad = {l: 44, r: 10, t: 12, b: 24}, pw = w - pad.l - pad.r, ph = h - pad.t - pad.b, n = labels.length;
     const totals = labels.map((_, i) => stacked ? series.reduce((a, s) => a + (s.values[i] || 0), 0) : Math.max(...series.map(s => s.values[i] || 0)));
     const max = Math.max(1e-9, ...totals), top = max <= 1 ? 1 : Math.ceil(max * 1.1);
-    g.font = '11px system-ui, sans-serif'; g.fillStyle = '#8fa1b8'; g.strokeStyle = '#26364a'; g.lineWidth = 1;
+    g.font = '11px system-ui, sans-serif'; g.fillStyle = '#667580'; g.strokeStyle = '#d5dce1'; g.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
       const y = pad.t + ph * (1 - i / 4);
       g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();

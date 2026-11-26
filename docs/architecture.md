@@ -30,7 +30,7 @@ FMS는 이 리포의 common을 직접 사용한다. 로봇·뷰어는 별도 AMR
   락 순서는 `JobCoordinator.lock → _EDIT_LOCK → LocationStore._lock`이다. 생성·zone 변경은 `edit_zone(activate=False)`로 새 버전을 준비하고
   location을 쓴 뒤 활성화한다. 두 파일은 원자적이지 않으므로 목록 조회가 양쪽을 대조해 broken을 표시하고 삭제로 정리한다.
   pickup zone은 `prohibit_zones()`에 들지 않아 굽지 않는다.
-- HTML/CSS/JS는 `fms_server/static/`에서 제공하며 npm 빌드나 CDN은 필요 없다. `fms.js`는 현장·맵 선택과 Canvas, `zone-editor.js`/`map-points.js`는 배치 편집, `jobs.js`는 프리셋과 게시판을 맡는다.
+- HTML/CSS/JS는 `fms_server/static/`에서 제공하며 npm 빌드나 CDN은 필요 없다. `fms.js`는 현장·맵 선택과 Canvas, `zone-editor.js`/`map-points.js`는 배치 편집, `jobs.js`는 프리셋과 게시판을 맡는다. 메뉴 분류와 여닫기 방식은 [웹 UI 사용 순서](../fms_server/README.md#웹-ui-사용-순서)를 따른다.
 - `robot-details.js`는 DOM을 유지하며 팝업 데이터를 갱신한다. `elevator-status.js`는 운행 상태 표만 갱신해 연결 편집 폼을 보존한다. 서버 미연결, 상태 미수신, 오래된 마지막 수신값을 구분한다.
 
 ## 이벤트 로그와 그 위의 기능

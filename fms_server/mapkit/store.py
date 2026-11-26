@@ -428,7 +428,8 @@ class MapStore:
             files[ingest.ZONE_META_NAME] = json.dumps({"zones": [
                 {"id": z.zone_id, "name": z.name, "type": z.type.value,
                  "polygon": [[p.x, p.y] for p in z.polygon],
-                 "gates": [g.model_dump() for g in z.gates], "speed_limit": z.speed_limit} for z in zones
+                 "gates": [g.model_dump() for g in z.gates], "speed_limit": z.speed_limit,
+                 "door": z.door.model_dump() if z.door else None} for z in zones
             ]}, ensure_ascii=False).encode("utf-8")
             return self.ingest_upload(
                 map_id, files, activate=activate,

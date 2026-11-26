@@ -38,6 +38,8 @@ from fms_server.api.pickup_stations import router as pickup_stations_router
 from fms_server.config import settings
 from fms_server.elevator_ctl import ElevatorController
 from fms_server.elevator_sim import BuiltinElevatorSim
+from fms_server.door_ctl import DoorController
+from fms_server.door_sim import BuiltinDoorSim
 from fms_server.elevators import ElevatorStore
 from fms_server.coordinator import SiteCoordinator
 from fms_server.fleet import Fleet
@@ -79,6 +81,7 @@ async def lifespan(app: FastAPI):
     jobs = JobStore(settings.data_root)
     elevator_ctl = ElevatorController(settings, events=events,
                                       lease_path=Path(settings.data_root) / "elevator_leases.json")
+    door_ctl = DoorController(settings, events=events)
     robot_events = RobotEventRecorder(fleet, registry, events)
 
     def elevator_store():
@@ -88,10 +91,13 @@ async def lifespan(app: FastAPI):
         return app.state.elevators
 
     job_coordinator = JobCoordinator(fleet, registry, jobs, mqtt, elevators=elevator_store,
-                                     elevator_ctl=elevator_ctl, site_coordinator=coordinator, events=events)
+                                     elevator_ctl=elevator_ctl, site_coordinator=coordinator, events=events,
+                                     door_ctl=door_ctl)
     elevator_ctl.add_listener(job_coordinator.on_elevator_state)
     elevator_sim = (BuiltinElevatorSim(settings, elevator_store, lambda: app.state.sites)
                     if settings.elevator_sim else None)
+
+    door_sim = BuiltinDoorSim(settings) if settings.door_sim else None
 
     presets = PresetStore(settings.data_root)
     battery = BatteryManager(job_coordinator, registry, fleet, jobs, settings.data_root, events=events)
@@ -121,6 +127,8 @@ async def lifespan(app: FastAPI):
     app.state.job_coordinator = job_coordinator
     app.state.elevator_ctl = elevator_ctl
     app.state.elevator_sim = elevator_sim
+    app.state.door_ctl = door_ctl
+    app.state.door_sim = door_sim
 
     events.start()
     events.record("server.start")
@@ -134,12 +142,18 @@ async def lifespan(app: FastAPI):
     elevator_ctl.start()
     if elevator_sim is not None:
         elevator_sim.start()
+    door_ctl.start()
+    if door_sim is not None:
+        door_sim.start()
     allocator.start()
     log.info("FMS 서버 시작 완료")
     try:
         yield
     finally:
         allocator.stop()
+        if door_sim is not None:
+            door_sim.stop()
+        door_ctl.stop()
         if elevator_sim is not None:
             elevator_sim.stop()
         elevator_ctl.stop()

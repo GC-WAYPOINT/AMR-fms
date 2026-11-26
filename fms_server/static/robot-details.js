@@ -102,7 +102,7 @@ window.robotDetails = (()=>{
     set(c.localization,({LOCALIZED:'정상',LOCALIZING:'확인 중',UNLOCALIZED:'미확정'})[s?.localization]||'—');
     set(c.speed,number(s?.velocity,2,' m/s'));
     set(c.x,number(s?.pose?.x,3,' m'));set(c.y,number(s?.pose?.y,3,' m'));
-    set(c.heading,Number.isFinite(s?.pose?.theta)?number(s.pose.theta*180/Math.PI,1,'°'):'—');
+    set(c.heading,Number.isFinite(s?.pose?.theta)?number(s.pose.theta*180/Math.PI,3,'°'):'—');
     set(c.map,robot.assigned_map_id||'미배정');set(c.sync,s?robot.map_synced?'일치':'불일치':'확인 전');
     set(c.version,s?.map_version||'—');set(c.score,Number.isFinite(s?.localization_score)?number(s.localization_score*100,0,'%'):'—');
     set(c.size,Number.isFinite(s?.width)&&Number.isFinite(s?.length)?`${number(s.width)} × ${number(s.length)} m`:'—');

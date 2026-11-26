@@ -10,7 +10,7 @@ window.pointEditor = (()=>{
   function inBounds(p){const m=view.meta;return p.x>=m.origin_x&&p.y>=m.origin_y&&p.x<m.origin_x+m.width_px*m.resolution&&p.y<m.origin_y+m.height_px*m.resolution;}
   function sync(){
     for(const key of ['x','y','heading'])input(key).disabled=!pose||busy;
-    if(pose){input('x').value=Number(pose.x.toFixed(6));input('y').value=Number(pose.y.toFixed(6));input('heading').value=Number((pose.theta*180/Math.PI).toFixed(3));}
+    if(pose){input('x').value=Number(pose.x.toFixed(3));input('y').value=Number(pose.y.toFixed(3));input('heading').value=Number((pose.theta*180/Math.PI).toFixed(3));}
     $('#saveMapPoint').disabled=!pose||busy;$('#cancelMapPoint').disabled=busy;
     input('name').disabled=busy;input('type').disabled=busy||kind==='dock';input('entry').disabled=busy||kind!=='dock';
     $('#mapPointHint').textContent=busy?'위치를 저장하고 있습니다…':pose?'클릭해 위치를 옮기거나, 드래그·숫자 입력으로 방향을 조절하세요.':'맵에서 위치를 클릭하거나 드래그해 방향을 정하세요.';

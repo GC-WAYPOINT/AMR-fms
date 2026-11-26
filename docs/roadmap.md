@@ -2,7 +2,7 @@
 
 [프로젝트 시작 안내](../README.md) · [개발 구조](architecture.md) · [알려진 문제](known-issues.md)
 
-운영 기능의 단계별 계획이다. **0 ~ 5단계는 구현됐다 (5.4 제외).** 아래 본문은 계획 당시의 기록이고, 지금 동작의 설명은 각 기능 문서에 있다.
+운영 기능의 단계별 계획이다. **0 ~ 5단계는 구현됐다 (5.4 제외). 6단계는 계획만 있다.** 아래 본문은 계획 당시의 기록이고, 지금 동작의 설명은 각 기능 문서에 있다.
 
 | 단계 | 상태 | 지금 동작의 설명 |
 |---|---|---|
@@ -12,6 +12,7 @@
 | 3 교통·승강기 고도화 | 구현. 교착 자동 해소는 탑승 전 도착 층 예약 회수까지. 같은 방향 연속 진입(구역 정원 > 1)은 하지 않음 | [교통 제어](traffic.md), [승강기](elevators.md) |
 | 4 관측·외부 연동 | 구현 | [운영 제어와 관측](operations.md) |
 | 5 로봇 협조 | 5.1 ~ 5.3 구현 (FMS + AMR-simulator 로봇 클라이언트). 5.4 는 3.4 로 충분해 하지 않음 | [교통 제어](traffic.md), [개발 구조](architecture.md) |
+| 6 통행 방향 (우측/좌측) | 계획 (미착수, 결정 3건 대기) | [아래 6단계](#stage-6) |
 
 ## 타사 조사 요약
 
@@ -221,6 +222,79 @@
 - 5.2 Factsheet: retained 토픽 `fms/v1/{id}/factsheet` (모델, 크기, 최대 속도, 트레이 수, 지원 액션, 프로토콜 버전). FMS `fleet.py` 가 보관, 2.2 후보 필터에 사용. `State.traffic_control` 판정도 이쪽으로 이전.
 - 5.3 적재 상태: `State.loads: [{tray, payload_id}]`. `cargo.py` 장부와 대조해 불일치를 알림으로. 지금은 시간 기반 시뮬레이션이라 장부만 믿는다.
 - 5.4 일방통행 planner 제약: C++ planner 가 역방향 통과 비용을 막는 방식. 3.4 로 충분하면 하지 않는다.
+
+<a id="stage-6"></a>
+
+## 6단계 — 통행 방향 (우측/좌측, 양쪽 리포 작업)
+
+목표: 로봇 2대 이상이 오갈 수 있는 넓은 통로에서 로봇이 현장 규칙에 따라 우측 또는 좌측으로 통행한다.
+
+경로계획은 로봇(C++ A*, AMR-simulator `robot/src/planner.cpp`)이 하므로 FMS 만으로는 불가하다.
+FMS 는 현장 설정을 저장해 오더에 실어 보내고, 로봇 planner 가 "넓은 통로의 반대편 절반" 에 비용을 더한다.
+프로토콜 변경이므로 5단계와 같은 계약 순서를 따른다.
+
+### 설계 결정 (추천안)
+
+| 항목 | 추천안 | 이유 |
+|---|---|---|
+| 설정 범위 | 현장 단위 `site.json` 의 `traffic_rules: {side: off\|right\|left, min_width: m\|null}` | 한 현장(건물) 안 규칙은 하나여야 한다. FMS 전체 단일 값이면 환경변수 `FMS_LANE_SIDE` 로 대체 가능 |
+| 로봇 전달 | `Order` 에 선택 필드 `lane: {side, min_width}` | `annotations.json` 에 두면 설정 변경마다 모든 맵 새 버전·재동기화가 필요하고 교통 예약이 있으면 막힌다. instant action 은 재접속 시 상태를 잃는다 |
+| 2차선 판정 폭 | 플릿 공통 `min_width`. 비우면 FMS 가 `2 × 현장 로봇 최대 폭 + 3 × 0.3 m` 로 계산 | 로봇마다 자기 폭으로 판정하면 한 대는 우측, 한 대는 가운데로 달릴 수 있다 |
+| 미지원 로봇 | 배정은 하고 UI 경고만 | 통행 방향은 보조 규칙이지 충돌 방지 수단이 아니다. 필요하면 점유 존처럼 배정 거절로 바꾼다 |
+| 실행 중 설정 변경 | 이미 보낸 오더는 유지, 새 오더(재경로 `-rN` 포함)부터 적용 | 작업 스냅샷 규칙과 같다 |
+
+### 6.1 프로토콜 (이 리포 `common/` 원본)
+
+- `common/schemas.py`: `LaneRule(side: Literal["right","left"], min_width: float > 0)`, `Order.lane: Optional[LaneRule] = None`.
+  `Factsheet`·`State` 에 `lane_keeping: bool = False` (`traffic_control` 과 같은 판정 패턴).
+- AMR-simulator `viewer/common/` 에 `cp` (`test_common_sync.py` 통과) → C++ `schemas.hpp/.cpp` 포팅 (Order 파싱, Factsheet/State 발행).
+
+### 6.2 FMS
+
+- `sites.py`: `Site.traffic_rules`. `from_dict` 기본값으로 기존 `site.json` 그대로 읽힘.
+- API: `GET/PUT /api/v1/sites/{site}/traffic-rules`. 변경 시 이벤트 `site.traffic_rules` (actor 포함).
+  응답에 계산된 `effective_min_width` 와 미지원 로봇 목록.
+- `task.py`: 오더 생성 지점(일반·stage·재경로)에서 `lane` 부착. 한 함수로 모은다.
+- UI (`admin.html` 현장 설정): 통행 방향(없음/우측/좌측), 2차선 최소 폭 입력, 계산된 기본값 표시, 미지원 로봇 경고.
+
+### 6.3 로봇 planner (AMR-simulator, 핵심)
+
+- **LaneField** (맵·`min_width` 별 캐시): FREE 칸마다 4축(0°, 45°, 90°, 135°) 방향으로 양쪽 벽까지 run-length 를 미리 계산한다 (칸 수 × 4 순회).
+- **A\* 비용**: 지금 `astar` 의 `cell_factor(nx, ny)` 는 방향을 모른다. 이동 방향을 받는 `step_factor(cx, cy, dx, dy)` 로 바꾼다.
+  - 진행 방향의 수직 축에서 오른쪽 거리 r, 왼쪽 거리 l, 폭 W = l + r.
+  - `min_width ≤ W ≤ 홀 상한`(예: 3 × min_width) 이면 2차선 통로로 본다. 중앙 주행(`CenterlineParams`) 의 기준을 통로 중앙 대신 **차선 중앙**(지킬 쪽 벽에서 W/4)으로 옮기고, 반대편 절반에는 가산 비용을 준다. 금지가 아닌 가산이므로 반대편 목적지에도 도달한다.
+  - 좁은 통로·넓은 홀·교차로는 기존 동작 그대로.
+  - 주의: 픽셀 좌표는 y 가 아래 방향이라 좌우 부호가 뒤집힌다. 단위 테스트로 고정한다.
+- **적용 지점**:
+  - `plan_path` 와 `plan_path_window` 둘 다 (장애물 우회도 지킬 쪽으로 돌도록).
+  - 통행 방향이 켜져 있으면 `refine_path`(PSO)를 끈다 (경로를 통로 중앙으로 되돌린다).
+  - 경유점 단순화는 `simplify_within` 만 쓴다 (시야만 보는 단순화는 중앙선을 가로지른다).
+- `executor.cpp`: 현재 오더의 `lane` 을 planner 에 넘긴다. 오더에 `lane` 이 없으면 기존 동작과 같다.
+
+### 6.4 검증
+
+- Python: 스키마 왕복·구형 Order/Factsheet 호환, `site.json` 하위 호환, API (`TestClient` 패턴), 오더 `lane` 부착 (가짜 `Mqtt` 패턴), `min_width` 자동 계산.
+- C++ `make -C robot test`: 폭 3 m 통로에서 양방향 경로가 서로 반대쪽으로 비켜 감, 폭 1 m 통로는 그대로, 좌측 모드는 좌우 반전, 홀은 그대로, 반대편 끝 목적지 도달.
+- 시나리오: `scripts/scenarios/head_on_wide.json` 추가 (넓은 통로에서 마주 오는 2대가 멈추지 않고 지나가는지, 최소 간격 검사). 기존 `head_on` 은 회귀로 다시 돌린다.
+- 전체 pytest, `tools/physics_test.py`.
+
+### 6.5 문서
+
+- `docs/traffic.md` 에 "통행 방향" 절 (기능 설명은 여기 한 곳에만), `fms_server/README.md` API 표.
+- AMR-simulator README, CLAUDE.md·AGENTS.md (서로 사본). 커밋은 두 리포 각각.
+
+### 한계 (구현 시 문서에 명시)
+
+- 통행 방향은 경로 편향일 뿐 충돌을 막지 않는다. 위험 공간은 계속 점유 존으로 지정한다.
+- 교차로, 폭이 바뀌는 곳, 넓은 홀에는 적용되지 않는다.
+- 폭이 크게 다른 로봇이 섞이면 `min_width` 를 직접 정한다.
+- 자동 판정이 현장과 맞지 않을 때의 대안: "양방향 통로 구역" 을 직접 그리는 방식. 이번 범위 밖.
+
+### 착수 전 확인할 것
+
+1. 설정 범위: 현장 단위(추천) / FMS 전체 단일 값.
+2. 미지원 로봇: 경고만(추천) / 배정 거절.
+3. 웹 실시간 맵에 "2차선으로 판정된 통로" 겹쳐 보이기 (Python 으로 같은 알고리즘 포팅) 를 범위에 넣을지.
 
 ## 범위 밖
 

@@ -121,6 +121,16 @@ class ZonePlanner:
                 self.free[y0:y1, x0:x1] &= grid[y0+dy:y1+dy, x0+dx:x1+dx]
         self.cache = {}
         self.grids = {}
+        self.obstacles = ()           # 맵 전역 장애물 [(x, y, width, height)]. set_obstacles 로 바꾼다
+        self.obstacle_margin = state.width / 2 + 0.05
+
+    def set_obstacles(self, rects):
+        """막힌 통로를 경로 선택에 반영한다. 바뀌면 거리 캐시를 비운다."""
+        rects = tuple(sorted((round(x, 3), round(y, 3), round(w, 3), round(h, 3)) for x, y, w, h in rects))
+        if rects != self.obstacles:
+            self.obstacles = rects
+            self.cache.clear()
+            self.grids.clear()
 
     def mask(self, allowed):
         if allowed not in self.grids:
@@ -136,6 +146,11 @@ class ZonePlanner:
                 dx,dy = wx-cx,wy-cy
                 free[(np.abs(ux*dx+uy*dy) <= half_width+self.margin)
                      & (np.abs(-uy*dx+ux*dy) <= half_height+self.margin)] = False
+            for x, y, w, h in self.obstacles:
+                hw, hh = w / 2 + self.obstacle_margin, h / 2 + self.obstacle_margin
+                p0 = self.model.world_to_pixel(x - hw, y - hh)
+                p1 = self.model.world_to_pixel(x + hw, y + hh)
+                free[max(0, p0[1]):max(0, p1[1] + 1), max(0, p0[0]):max(0, p1[0] + 1)] = False
             self.grids[allowed] = free
         return self.grids[allowed]
 
@@ -148,7 +163,10 @@ class ZonePlanner:
         h, w = free.shape
         def ok(p):
             return 0 <= p[0] < w and 0 <= p[1] < h and free[p[1], p[0]]
-        if not ok(start) or not ok(goal):
+        # 출발점은 장애물 바로 옆에 서 있을 수 있다 (막혀서 멈춘 로봇). 정적 맵에서 갈 수 있으면 출발은 허용한다.
+        start_ok = ok(start) or (self.obstacles and 0 <= start[0] < w and 0 <= start[1] < h
+                                 and self.free[start[1], start[0]])
+        if not start_ok or not ok(goal):
             return math.inf
         q, costs = [(0, 0, start)], {start: 0}
         while q:
@@ -209,11 +227,15 @@ class ZonePlanner:
 
 
 class TrafficController:
-    def __init__(self, registry, fleet, jobs, events=None):
+    def __init__(self, registry, fleet, jobs, events=None, doors=None):
         self.registry, self.fleet, self.jobs = registry, fleet, jobs
         self.events = events
+        from fms_server.obstacles import ObstacleRegistry
+        self.obstacles = ObstacleRegistry(registry, fleet, events)   # 맵 전역 장애물 (경로 선택·재경로에 쓴다)
+        self.doors = doors   # DoorController (자동문 존용). 없으면 자동문 존에서 문이 안 열려 계속 기다린다
         self.aside_requests = set()   # (site_id, robot_id): 길을 막고 선 유휴 로봇. 코디네이터가 대기 위치로 보낸다
         self._motion = {}             # robot_id -> 정체 판정용 {x, y, since, waiting_since, reported}
+        self.reroute_tried = {}       # job_id -> 마지막 재경로 판단 시각 (너무 자주 계산하지 않는다)
         self._deadlocks = {}          # frozenset(로봇) -> 처음 본 시각 (같은 순환을 반복 기록하지 않는다)
         self._conflicts = {}          # (로봇 a, 로봇 b) -> {since, last, paused}
         self.analysis = {"edges": [], "deadlocks": [], "stalls": [], "conflicts": []}
@@ -291,7 +313,10 @@ class TrafficController:
             unauthorized = any(rid != (lease or {}).get('robot') for rid in occupants)
             status = 'blocked' if unknown or unauthorized else 'occupied' if occupants else 'reserved' if lease else 'free'
             zones.append({'zone_id':z.zone_id,'name':z.name,'status':status,
-                          'owner':(lease or {}).get('robot'),'occupants':occupants})
+                          'owner':(lease or {}).get('robot'),'occupants':occupants,
+                          'door':(dict(door_id=z.door.door_id, **(self.doors.snapshot(z.door.door_id) if self.doors
+                                                                  else dict(liveness='UNKNOWN', door=None)))
+                                  if z.door else None)})
         on_map = {r.robot_id for r in records if r.state and r.state.map_id == uid}
         on_map.update(a.robot_id for a in self.registry.get_site(site).robots.values() if a.map_id == map_id)
         analysis = self.analysis
@@ -301,6 +326,7 @@ class TrafficController:
                 "stalls": [s for s in analysis["stalls"] if s["robot_id"] in on_map],
                 "conflicts": [c for c in analysis["conflicts"] if set(c["robots"]) & on_map],
                 "zones": zones,
+                "obstacles": self.obstacles.snapshot(site, map_id),
                 "leases": [dict(v, resource=k) for k, v in self.data["leases"].items() if v["map"] == key],
                 "waiting": [{"job_id": j.job_id, "robot_id": j.robot_id,
                              "reason": j.traffic.get("waiting")}
@@ -318,17 +344,13 @@ class TrafficController:
         supported = record.traffic_control if record is not None and record.factsheet is not None else state.traffic_control
         if zones and not supported:
             raise TrafficError("이 로봇은 점유 존 제어를 지원하지 않습니다. 클라이언트를 갱신하세요")
-        planner = None
-        if zones:
-            cache_key = (job.site_id, map_id, version, state.width, state.length)
-            if cache_key not in self.planners:
-                self.planners = {cache_key: ZonePlanner(store.load_map_model(map_id, version), zones, state)}
-            planner = self.planners[cache_key]
+        planner = self._planner(store, job.site_id, map_id, version, zones, state) if zones else None
+        obstacles = self.obstacles.rects(job.site_id, map_id) if planner else []
         nodes, crossings, sources = [], [], {}
         previous = state.pose
         for original in order.nodes:
             # 직선/도킹/언도킹은 우회할 수 없다. 존을 걸치는 설비는 등록 시 분리한다.
-            route = planner.route(previous, original.position) if planner else []
+            route = self._route(planner, previous, original.position, obstacles) if planner else []
             for z, gate in route:
                 seq = len(nodes)
                 nodes.append(OrderNode(node_id=f"{order.order_id}-traffic-{seq}", sequence_id=seq,
@@ -336,7 +358,8 @@ class TrafficController:
                 nodes.append(OrderNode(node_id=f"{order.order_id}-traffic-{seq+1}", sequence_id=seq+1,
                                        released=False, position=gate.exit, allowed_zone_ids=[z.zone_id]))
                 crossings.append({"zone": z.zone_id, "gate": gate.gate_id, "wait": seq,
-                                  "exit": seq+1, "bounds": bounds(z), "done": False})
+                                  "exit": seq+1, "bounds": bounds(z), "done": False,
+                                  "door": z.door.door_id if z.door else None})
             n = original.model_copy(deep=True)
             n.sequence_id, n.released = len(nodes), False
             sources[n.node_id] = original.sequence_id
@@ -346,6 +369,40 @@ class TrafficController:
                        "version": version, "uid": store.map_uid(map_id), "crossings": crossings,
                        "sources": sources, "waiting": "층별 이동 허가 대기"}
         return order.model_copy(update={"nodes": nodes})
+
+    def _planner(self, store, site, map_id, version, zones, state):
+        cache_key = (site, map_id, version, state.width, state.length)
+        if cache_key not in self.planners:
+            self.planners = {cache_key: ZonePlanner(store.load_map_model(map_id, version), zones, state)}
+        return self.planners[cache_key]
+
+    @staticmethod
+    def _route(planner, start, goal, obstacles):
+        """맵 전역 장애물로 막힌 통로를 피해 gate 순서를 고른다. 피할 길이 없으면 장애물을 무시한 길로 대체한다
+        (로봇이 그 앞에서 스스로 기다리거나 돌아간다)."""
+        planner.set_obstacles(obstacles)
+        try:
+            return planner.route(start, goal)
+        except TrafficError:
+            if not obstacles:
+                raise
+            planner.set_obstacles(())
+            return planner.route(start, goal)
+
+    def preview_gates(self, job, map_id, state, positions, *, with_obstacles):
+        """지금 위치에서 positions 를 차례로 지나는 gate 순서 [(zone_id, gate_id)]. 재경로 필요 여부를 가릴 때 쓴다."""
+        store = self.registry.map_store(job.site_id)
+        version = store.active_version(map_id)
+        zones = [z for z in store.load_annotations(map_id, version).zones if z.type == ZoneType.OCCUPANCY]
+        if not zones:
+            return []
+        planner = self._planner(store, job.site_id, map_id, version, zones, state)
+        obstacles = self.obstacles.rects(job.site_id, map_id) if with_obstacles else []
+        gates, previous = [], state.pose
+        for goal in positions:
+            gates += [(z.zone_id, g.gate_id) for z, g in self._route(planner, previous, goal, obstacles)]
+            previous = goal
+        return gates
 
     def fresh(self, record):
         return (record is not None and record.state is not None
@@ -411,6 +468,36 @@ class TrafficController:
                 return False
         return True
 
+    def _door_open(self, job, door):
+        """문을 열고 붙잡는다. 열려 있으면 True. 이 존의 예약이 없는 시점이므로 다른 작업의 붙잡음은 낡은 것이다."""
+        if self.doors is None:
+            return False
+        holder = self.doors.holder(door)
+        if holder is not None and holder != job.job_id:
+            self.doors.release(door, holder)
+        opened = self.doors.request_open(door, job.job_id)
+        if opened and job.traffic.get("door_open") != door:
+            job.traffic["door_open"] = door
+            if self.events is not None:
+                self.events.record("door.open", site_id=job.site_id, robot_id=job.robot_id,
+                                   job_id=job.job_id, door_id=door)
+        return opened
+
+    def _sweep_doors(self):
+        """존 예약이 없는데 문을 붙잡은 작업이 끝났으면 놓는다 (대기 중 취소된 경우)."""
+        if self.doors is None:
+            return
+        held = {l.get("door"): l["job"] for l in self.data["leases"].values() if l.get("kind") == "zone"}
+        for door, owner in self.doors.holds().items():
+            if held.get(door) == owner:
+                continue
+            try:
+                terminal = self.jobs.get(owner).status.terminal
+            except Exception:
+                terminal = True
+            if terminal:
+                self.doors.release(door, owner)
+
     def _zone_clear(self, job, crossing):
         for r in self._peers(job):
             if not self.fresh(r) or intersects(crossing["bounds"], r.state.pose, radius(r.state)):
@@ -457,8 +544,11 @@ class TrafficController:
                 self._event("traffic.release", lease, key)
                 del self.data["leases"][key]
                 changed = True
+                if lease.get("door") and self.doors is not None:
+                    self.doors.release(lease["door"], lease["job"])
         if changed:
             self.save()
+        self._sweep_doors()
 
     def update(self, job):
         """기존 허가를 유지하고 대기 node/출구까지 연속해서 허가한다."""
@@ -514,13 +604,21 @@ class TrafficController:
             at_wait = (s.order_id == order.order_id and s.last_node_id == wait.node_id
                        and abs(s.velocity) < 0.01 and math.hypot(s.pose.x-wait.position.x,s.pose.y-wait.position.y) < 0.08)
             end = order.nodes[c["exit"]]
-            if (at_wait and zk not in leases and self._zone_clear(job, c)
-                    and self._clear_space(job, end.position, radius(s))):
+            door = c.get("door")
+            ready = (at_wait and zk not in leases and self._zone_clear(job, c)
+                     and self._clear_space(job, end.position, radius(s)))
+            if ready and door:
+                # 자동문: 대기(진입) node 에서 열림 신호를 보내고, 열린 것을 확인해야 존에 들어간다.
+                if not self._door_open(job, door):
+                    through = c["wait"]
+                    self.set_waiting(job, self.doors.reason(door) if self.doors else "자동문 제어기 없음")
+                    break
+            if ready:
                 leases[zk] = {"map": t["map"], "robot": job.robot_id, "job": job.job_id,
                               "kind": "zone", "at": time.time(), "order": order.order_id,
                               "pose": end.position.model_dump(), "radius": radius(s),
                               "exit_id": end.node_id, "exit": c["exit"], "bounds": c["bounds"],
-                              "update": order.order_update_id+1}
+                              "update": order.order_update_id+1, "door": door}
                 self.save()
                 self._event("traffic.reserve", leases[zk], zk)
                 through = c["exit"]

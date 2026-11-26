@@ -7,7 +7,11 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from common.map_annotations import TrafficGate, Zone, ZoneType, rectangle_polygon, rectangles_overlap
+import math
+
+from common.map_annotations import (AutoDoor, TrafficGate, Zone, ZoneType, rectangle_frame, rectangle_polygon,
+                                    rectangles_overlap)
+from common.schemas import Point
 from fms_server.mapkit.store import MapStoreError, MapVersionConflict, ZoneNotFound
 from fms_server.sites import SiteError
 
@@ -18,7 +22,7 @@ class RectangleZoneRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False, str_strip_whitespace=True)
     base_version: str = Field(min_length=1)
     name: str = Field(min_length=1, max_length=128)
-    type: Literal['prohibit', 'elevator', 'occupancy', 'slow']
+    type: Literal['prohibit', 'elevator', 'occupancy', 'slow', 'autodoor']
     speed_limit: float | None = Field(default=None, gt=0, le=10)   # 감속 구역(slow)의 최고 속도 m/s
     gates: list[TrafficGate] = Field(default_factory=list, max_length=16)
     x: float
@@ -26,6 +30,9 @@ class RectangleZoneRequest(BaseModel):
     width: float = Field(gt=0)
     height: float = Field(gt=0)
     rotation: float = 0  # 도 단위. 회전 전 사각형의 중심을 고정한다
+    # 자동문(type=autodoor) 전용. 점유 존 + door 로 저장한다 (로봇은 일반 점유 존으로 본다).
+    door_id: str | None = Field(default=None, pattern=r'^[A-Za-z0-9_-]+$', max_length=64)  # 없으면 zone_id
+    door_nodes: list[Point] | None = Field(default=None, min_length=2, max_length=2)       # [A, B]. 없으면 문 양쪽 기본 위치
 
     @model_validator(mode='after')
     def validate_zone(self):
@@ -33,8 +40,31 @@ class RectangleZoneRequest(BaseModel):
         return self
 
     def zone(self, zone_id: str) -> Zone:
+        polygon = rectangle_polygon(self.x,self.y,self.width,self.height,self.rotation)
+        if self.type == 'autodoor':
+            if self.gates:
+                raise ValueError('자동문의 진입점은 door_nodes 로 지정한다')
+            a, b = self.door_nodes or default_door_nodes(polygon)
+            return Zone(zone_id=zone_id, name=self.name, type=ZoneType.OCCUPANCY, polygon=polygon,
+                        door=AutoDoor(door_id=self.door_id or zone_id, node_a=a, node_b=b))
+        if self.door_id or self.door_nodes:
+            raise ValueError('door_id·door_nodes 는 자동문(autodoor)에만 지정할 수 있다')
         return Zone(zone_id=zone_id, name=self.name, type=self.type, gates=self.gates, speed_limit=self.speed_limit,
-                    polygon=rectangle_polygon(self.x,self.y,self.width,self.height,self.rotation))
+                    polygon=polygon)
+
+
+DOOR_NODE_OFFSET = 0.8  # 자동문 기본 진입점이 문 구역 경계에서 떨어지는 거리 (m)
+
+
+def default_door_nodes(polygon) -> tuple[Point, Point]:
+    """문 구역의 짧은 변 방향(통과 방향)으로 양쪽 경계 밖에 진입점 A·B 를 둔다."""
+    cx, cy, ux, uy, half_w, half_h = rectangle_frame(polygon)
+    if half_w <= half_h:
+        dx, dy, half = ux, uy, half_w
+    else:
+        dx, dy, half = -uy, ux, half_h
+    d = half + DOOR_NODE_OFFSET
+    return Point(x=cx - dx * d, y=cy - dy * d), Point(x=cx + dx * d, y=cy + dy * d)
 
 
 def _edit_locked(request, site_id, map_id, version, zone_id, zone=None, *, create=False):
@@ -53,6 +83,18 @@ def _edit_locked(request, site_id, map_id, version, zone_id, zone=None, *, creat
             if any(r.state and r.state.map_id == uid and (r.state.order_id or abs(r.state.velocity) > .01)
                    for r in request.app.state.fleet.all()):
                 raise HTTPException(409, '이동 중인 로봇이 있습니다. 정지한 뒤 점유 존을 편집하세요.')
+            if zone and zone.door:
+                for site in request.app.state.sites.list_sites():
+                    other_store = request.app.state.sites.map_store(site.site_id)
+                    for summary in other_store.list_maps():
+                        if site.site_id == site_id and summary.map_id == map_id:
+                            others = [z for z in store.load_annotations(map_id).zones if z.zone_id != zone_id]
+                        elif other_store.active_version(summary.map_id):
+                            others = other_store.load_annotations(summary.map_id).zones
+                        else:
+                            continue
+                        if any(z.door and z.door.door_id == zone.door.door_id for z in others):
+                            raise HTTPException(422, f'자동문 id {zone.door.door_id!r} 는 이미 쓰고 있습니다.')
             if zone and zone.type == ZoneType.OCCUPANCY:
                 model = store.load_map_model(map_id)
                 for other in store.load_annotations(map_id).zones:

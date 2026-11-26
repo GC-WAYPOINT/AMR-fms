@@ -204,6 +204,7 @@ def build_annotations(
                     type=ztype,
                     speed_limit=speed_limit if ztype == ZoneType.SLOW else None,
                     gates=entry.get("gates", []),
+                    door=entry.get("door"),
                     polygon=[Point(x=float(p[0]), y=float(p[1])) for p in poly],
                 )
             )

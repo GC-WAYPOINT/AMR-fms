@@ -48,12 +48,13 @@ node --test fms_server/tests/zone-geometry.test.js                   # JS 기하
 - 로봇 프로토콜을 바꾸면 순서: 이 리포 `common/` 수정 -> `cp` 로 AMR-simulator `viewer/common/` 갱신 -> C++ 포팅 -> 양쪽 리포 각각 커밋. 한쪽만 바꾸면 State 파싱(`extra=forbid`)에서 깨진다.
 - MQTT 토픽:
   - 로봇: `fms/v1/{id}/{order,instant,state,connection,factsheet}` (factsheet 는 retained, 선택). 맵은 `SET_MAP` instant action 의 URL 로 번들 zip 을 로봇이 받아간다 (`FMS_PUBLIC_URL`).
+  - 자동문: `door/v1/{door_id}/{state,cmd}` (`common/door_proto.py`, 내장 시뮬레이터 `FMS_DOOR_SIM=1`). 맵에는 `type=occupancy` + `door` 필드로 저장해 로봇은 일반 점유 존으로 본다 ([docs/autodoor.md](docs/autodoor.md)).
   - 승강기: `elev/v1/{elevator_id}/{state,cmd}` (`common/elevator_proto.py`). 내장 시뮬레이터(`FMS_ELEVATOR_SIM=1`, 기본)와 외부 `tools/elevator_sim.py` 가 같은 계약을 쓴다.
 - 단위: API 의 `theta` 는 라디안, 웹 입력과 구역 `rotation` 은 도(°).
 
 ## 구조
 
-세부는 [docs/architecture.md](docs/architecture.md), 기능별로 [docs/traffic.md](docs/traffic.md)·[docs/elevators.md](docs/elevators.md)·[docs/pickup-station.md](docs/pickup-station.md), 제약은 [docs/known-issues.md](docs/known-issues.md), 미구현 기능 계획은 [docs/roadmap.md](docs/roadmap.md). 요약:
+세부는 [docs/architecture.md](docs/architecture.md), 기능별로 [docs/traffic.md](docs/traffic.md)·[docs/autodoor.md](docs/autodoor.md)·[docs/elevators.md](docs/elevators.md)·[docs/pickup-station.md](docs/pickup-station.md), 제약은 [docs/known-issues.md](docs/known-issues.md), 미구현 기능 계획은 [docs/roadmap.md](docs/roadmap.md). 요약:
 
 - `main.py` lifespan: 저장소·MQTT·맵 코디네이터·작업 코디네이터·승강기 제어기/내장 시뮬레이터·배정 루프를 만들어 `app.state` 에 싣는다. `api/` 라우터는 전역 객체 대신 `request.app.state.*` 로 꺼내 쓴다.
 - `task.py`(작업 상태·Order·다층 stage), `route.py`(층간 계획), `allocator.py`(1초 배정), `traffic.py`(맵별 정원·점유 존 예약, `traffic.json`).

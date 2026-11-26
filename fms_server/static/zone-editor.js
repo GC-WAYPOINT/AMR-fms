@@ -12,6 +12,10 @@ window.zoneEditor = (() => {
   // step: zone | node(픽업) | return(반납). 두 node 는 같은 방식(클릭=위치, 드래그=방향)으로 편집한다.
   let pickup = false, node = null, ret = null, step = 'zone', nodeGesture = null;
   let gates = [];
+  // 자동문: 진입점 A·B. 사용자가 고치기 전(doorTouched=false)에는 구역 모양에서 기본 위치를 계산해 보여 준다.
+  let doorNodes = null, doorTouched = false;
+  const DOOR_OFFSET = 0.8;   // 서버 api/zones.py DOOR_NODE_OFFSET 과 같다
+  const doorKeys = ['doorAx', 'doorAy', 'doorBx', 'doorBy'];
   const field = name => form.elements.namedItem(name);
   const dimensionKeys = ['x', 'y', 'width', 'height', 'rotation'];
   const nodeKeys = ['nodeX', 'nodeY', 'nodeHeading'];
@@ -72,12 +76,33 @@ window.zoneEditor = (() => {
   // 일방통행 통로 = 진입 방향(gate)이 하나뿐인 점유 존. 저장 형식은 점유 존과 같다 (새 로직 없음).
   const oneway = () => field('type').value === 'oneway';
   const occupancy = () => ['occupancy', 'oneway'].includes(field('type').value);
+  const autodoor = () => !pickup && field('type').value === 'autodoor';
+  function defaultDoorNodes() {
+    if (!rect) return null;
+    const c = geometry.center(rect), short = rect.width <= rect.height;
+    const d = (short ? rect.width : rect.height) / 2 + DOOR_OFFSET;
+    const a = geometry.world(short ? {x: -d, y: 0} : {x: 0, y: -d}, rect);
+    const b = geometry.world(short ? {x: d, y: 0} : {x: 0, y: d}, rect);
+    return {a: {x: a.x, y: a.y}, b: {x: b.x, y: b.y}};
+  }
+  const currentDoorNodes = () => doorTouched ? doorNodes : defaultDoorNodes();
   function sync() {
     $('#addTrafficGate').hidden = oneway();
     $('#zoneSpeedLabel').hidden = pickup || field('type').value !== 'slow';
     field('speedLimit').disabled = busy;
     $('#trafficGateFields').hidden = pickup || field('type').value !== 'occupancy';
-    if (!pickup) $('#zoneDescription').textContent = occupancy()
+    $('#doorFields').hidden = !autodoor();
+    if (autodoor()) {
+      const n = currentDoorNodes();
+      field('doorId').disabled = busy;
+      doorKeys.forEach((k, i) => {
+        field(k).disabled = !rect || busy;
+        if (!doorTouched) field(k).value = n ? Number([n.a.x, n.a.y, n.b.x, n.b.y][i].toFixed(3)) : '';
+      });
+    }
+    if (!pickup) $('#zoneDescription').textContent = autodoor()
+      ? '문 구역을 지나는 경로에 자동문 통과 단계가 들어갑니다. 한 대씩 통과하고, 진입점에서 문 열림 신호를 보냅니다. 저장하면 새 맵 버전을 로봇에 전달합니다.'
+      : occupancy()
       ? (oneway() ? '대기 node 에서 출구 node 방향으로만, 한 대씩 통과합니다. 반대 방향 진입로는 만들지 않습니다. 저장하면 새 맵 버전을 로봇에 전달합니다.'
         : '한 대씩 통과합니다. 대기·출구는 차체 여유를 두고 배치하세요. 저장하면 새 맵 버전을 로봇에 전달합니다.')
       : field('type').value === 'slow' ? '구역 안에서 로봇이 이 속도 이하로 달립니다. 주행을 막지는 않습니다. 감속을 지원하는 로봇 클라이언트가 필요합니다.'
@@ -86,13 +111,13 @@ window.zoneEditor = (() => {
     $('#trafficGateRows').querySelectorAll('input,select,button').forEach(control => { control.disabled = busy; });
     for (const k of dimensionKeys) {
       field(k).disabled = !rect || busy;
-      field(k).value = rect ? Number(rect[k].toFixed(9)) : '';
+      field(k).value = rect ? Number(rect[k].toFixed(3)) : '';
     }
     for (const [keys, value] of [[nodeKeys, node], [returnKeys, ret]]) {
       for (const k of keys) field(k).disabled = !value || busy;
       if (value) {
-        field(keys[0]).value = Number(value.x.toFixed(6));
-        field(keys[1]).value = Number(value.y.toFixed(6));
+        field(keys[0]).value = Number(value.x.toFixed(3));
+        field(keys[1]).value = Number(value.y.toFixed(3));
         field(keys[2]).value = Number((value.theta * 180 / Math.PI).toFixed(3));
       }
     }
@@ -136,11 +161,18 @@ window.zoneEditor = (() => {
     // 반납 node 도입 전 스테이션은 반납 지점 지정부터 시작한다.
     step = station && node && !ret ? 'return' : 'zone';
     form.reset();
-    gates = structuredClone(zone?.gates || []);
+    gates = structuredClone(zone?.door ? [] : zone?.gates || []);
+    doorNodes = zone?.door ? {a: {...zone.door.node_a}, b: {...zone.door.node_b}} : null;
+    doorTouched = !!zone?.door;
     renderGates();
     field('name').value = station?.name || zone?.name || '';
     if (zone?.speed_limit) field('speedLimit').value = zone.speed_limit;
-    field('type').value = pickup ? 'prohibit' : zone?.type === 'occupancy' && gates.length === 1 ? 'oneway' : (zone?.type || 'prohibit');
+    field('type').value = pickup ? 'prohibit' : zone?.door ? 'autodoor' : zone?.type === 'occupancy' && gates.length === 1 ? 'oneway' : (zone?.type || 'prohibit');
+    field('doorId').value = zone?.door?.door_id || '';
+    if (zone?.door) {
+      field('doorAx').value = Number(zone.door.node_a.x.toFixed(3)); field('doorAy').value = Number(zone.door.node_a.y.toFixed(3));
+      field('doorBx').value = Number(zone.door.node_b.x.toFixed(3)); field('doorBy').value = Number(zone.door.node_b.y.toFixed(3));
+    }
     $('#zoneTypeLabel').hidden = pickup;
     $('#pickupNodeFields').hidden = !pickup;
     $('#zoneDescription').textContent = pickup
@@ -270,7 +302,7 @@ window.zoneEditor = (() => {
   }
   function drawEditor() {
     if (!active || !view.image) return;
-    const color = pickup ? PICKUP_COLOR : occupancy() ? '#59c8be' : field('type').value==='elevator' ? '#ab9aee' : '#f2848c';
+    const color = pickup ? PICKUP_COLOR : occupancy() || autodoor() ? '#59c8be' : field('type').value==='elevator' ? '#ab9aee' : '#f2848c';
     if (rect) {
       const pts=geometry.corners(rect).map(point), a=pts[0];
       ctx.save(); ctx.fillStyle=color+'45'; ctx.strokeStyle=color; ctx.lineWidth=2;
@@ -284,12 +316,19 @@ window.zoneEditor = (() => {
           ctx.beginPath();ctx.arc(x,y,6,0,Math.PI*2);ctx.fill();ctx.stroke();
         }else{ctx.fillRect(x-4,y-4,8,8);ctx.strokeRect(x-4,y-4,8,8);}
       }
-      text(`${rect.width.toFixed(2)} × ${rect.height.toFixed(2)} m · ${rect.rotation.toFixed(1)}°`, a.x, a.y-12, color);
+      text(`${rect.width.toFixed(3)} × ${rect.height.toFixed(3)} m · ${rect.rotation.toFixed(3)}°`, a.x, a.y-12, color);
       ctx.restore();
     }
     if (pickup) {
       drawNode(node, color, '⇲ 픽업', step === 'node');
       drawNode(ret, RETURN_COLOR, '⇱ 반납', step === 'return');
+    } else if (autodoor()) {
+      const n = currentDoorNodes();
+      if (n) {
+        const ab = Math.atan2(n.b.y - n.a.y, n.b.x - n.a.x);
+        drawNode({...n.a, theta: ab}, color, '문 A', false);
+        drawNode({...n.b, theta: ab + Math.PI}, '#e2bd79', '문 B', false);
+      }
     } else if (occupancy()) {
       gates.forEach((g,i) => {
         drawNode(g.wait, color, `대기 ${i+1}`, false);
@@ -352,7 +391,7 @@ window.zoneEditor = (() => {
         const labelNode = el('label', title), select = el('select');
         select.append(new Option('선택하세요', ''));
         if (gate[key]) {
-          select.append(new Option(`저장 좌표 (${gate[key].x.toFixed(2)}, ${gate[key].y.toFixed(2)})`, 'saved'));
+          select.append(new Option(`저장 좌표 (${gate[key].x.toFixed(3)}, ${gate[key].y.toFixed(3)})`, 'saved'));
           select.value = 'saved';
         }
         choices.forEach((c,i) => select.append(new Option(c.name, String(i))));
@@ -364,6 +403,14 @@ window.zoneEditor = (() => {
       box.append(row);
     });
   }
+  doorKeys.forEach(k => field(k).addEventListener('input', () => {
+    if (!doorTouched) {   // 처음 고치는 순간 현재 기본값을 그대로 붙잡아 두고 이 칸만 바꾼다
+      const n = defaultDoorNodes();
+      doorNodes = n && {a: {...n.a}, b: {...n.b}};
+      doorTouched = true;
+    }
+    draw();
+  }));
   $('#addTrafficGate').onclick = () => {
     gates.push({gate_id:`gate-${Date.now()}-${Math.random().toString(16).slice(2)}`,wait:null,exit:null}); renderGates();
   };
@@ -402,6 +449,17 @@ window.zoneEditor = (() => {
         if (data.type === 'slow') {
             data.speed_limit = Number(field('speedLimit').value);
             if (!(data.speed_limit > 0)) throw new Error('감속 구역의 최고 속도를 입력하세요.');
+        }
+        if (autodoor()) {
+          data.type = 'autodoor';
+          const id = field('doorId').value.trim();
+          if (id) data.door_id = id;
+          if (doorTouched) {
+            const v = doorKeys.map(k => Number(field(k).value));
+            if (doorKeys.some(k => field(k).value === '') || v.some(n => !Number.isFinite(n)))
+              throw new Error('진입점 A·B 의 좌표를 모두 입력하세요.');
+            data.door_nodes = [{x: v[0], y: v[1]}, {x: v[2], y: v[3]}];
+          }
         }
         if (data.type === 'occupancy') {
           if (!gates.length || gates.some(g => !g.wait || !g.exit)) throw new Error('방향별 대기 node와 출구 node를 선택하세요.');

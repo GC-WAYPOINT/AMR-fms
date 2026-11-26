@@ -3,7 +3,7 @@
 // fms.js 의 전역($, el, request, run, notify, app, siteURL, titles, showPage)을 그대로 쓴다.
 (() => {
   const S = {key:'', floors:[], elevators:[], pick:new Map(), editing:null, linked:new Map()};
-  const COLORS = {free:'#6aabff', picked:'#64c8a5', other:'#6b7a8f', hover:'#e3ba70'};
+  const COLORS = {free:'#0f6f78', picked:'#197552', other:'#7a878e', hover:'#9a7221'};
 
   const baseOf = id => `${siteURL()}/maps/${enc(id)}`;
   const slug = n => (n || '').trim().replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
@@ -48,7 +48,7 @@
     const sc = c.width / (x1 - x0);
     c.height = Math.ceil((y1 - y0) * sc);  // 폭에 맞추고 높이는 구역이 퍼진 범위에 맞춘다
     f.view = {x0, y0, sc};
-    ctx.fillStyle = '#0d131c'; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.fillStyle = '#dfe4e7'; ctx.fillRect(0, 0, c.width, c.height);
     ctx.imageSmoothingEnabled = false;
     const res = m.resolution;
     ctx.drawImage(f.image, (x0 - m.origin_x) / res, (y0 - m.origin_y) / res, (x1 - x0) / res, (y1 - y0) / res,

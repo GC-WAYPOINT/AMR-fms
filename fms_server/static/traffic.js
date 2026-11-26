@@ -1,7 +1,7 @@
 'use strict';
 // 주기 갱신은 입력 중인 제한값을 덮어쓰지 않는다.
 window.trafficView = (() => {
-  let current = '', dirty = false, busy = false, snapshot = null, generation = 0;
+  let current = '', dirty = false, busy = false, snapshot = null, generation = 0, fetchedAt = 0;
   const input = $('#trafficLimit'), pauseBox = $('#trafficConflictPause');
   input.addEventListener('input', () => { dirty = true; });
   pauseBox.addEventListener('change', () => { dirty = true; });
@@ -15,7 +15,7 @@ window.trafficView = (() => {
     if (!key) { $('#trafficStatus').replaceChildren(); return; }
     const result = await request(`${key}/traffic`);
     if (token !== generation || key !== current || key !== mapURL()) return;
-    snapshot = result;
+    snapshot = result; fetchedAt = Date.now();
     if (!dirty) { input.value = result.max_moving_robots ?? ''; pauseBox.checked = !!result.conflict_pause; }
     const box = $('#trafficStatus'); box.replaceChildren();
     // 교착(진짜 순환)과 정체(안 움직임)를 구분해 보인다. 자동 해소는 탑승 전 도착 층 예약 회수뿐이다.
@@ -27,6 +27,11 @@ window.trafficView = (() => {
     for (const lease of result.leases) {
       const label = lease.kind === 'floor' ? '이동 허가' : lease.kind === 'wait' ? '대기 node 예약' : '점유 존 예약';
       box.append(el('p', `${lease.robot} · ${label}${lease.future ? ' (도착 층)' : ''} · ${lease.resource.split(':').at(-1)}`));
+    }
+    // 맵 전역 장애물: 로봇이 보고한 정지 장애물을 일정 시간 기억해 경로 선택에 반영한다.
+    if ((result.obstacles || []).length) {
+      const soonest = Math.min(...result.obstacles.map(o => o.expires_in)), sec = Math.max(0, Math.round(soonest));
+      box.append(el('p', `전역 장애물 ${result.obstacles.length}칸 · 가장 빠른 해제 ${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')} 후 (다른 로봇이 지나가며 안 보이면 즉시 해제)`, 'warn'));
     }
     for (const waiting of result.waiting) box.append(el('p', `${waiting.robot_id} · ${waiting.reason}`));
     if (!result.leases.length && !result.waiting.length) box.append(el('p','예약·대기 중인 로봇이 없습니다.','muted'));
@@ -52,5 +57,7 @@ window.trafficView = (() => {
     });
   });
   setInterval(() => { if (!busy) run(refresh); }, 1500);
-  return {refresh, get snapshot(){return app.site && app.map && current===mapURL() ? snapshot : null;}};
+  // 남은 시간이 1초마다 줄어 보이도록 장애물이 있을 때만 지도를 다시 그린다.
+  setInterval(() => { if (snapshot && (snapshot.obstacles || []).length) draw(); }, 1000);
+  return {refresh, get fetchedAt(){return fetchedAt;}, get snapshot(){return app.site && app.map && current===mapURL() ? snapshot : null;}};
 })();
