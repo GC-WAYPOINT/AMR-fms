@@ -10,12 +10,14 @@ import json
 import math
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from common.map_annotations import ZoneType, rectangle_frame
-from common.schemas import LocalizationState, OrderNode, RobotState
+from common.schemas import ActionType, BusySubState, LocalizationState, Order, OrderNode, Pose, RobotState
+from fms_server import zone_grid
 from fms_server.fleet import RobotLiveness
 
 
@@ -31,6 +33,9 @@ CONFLICT_MIN_SPEED = 0.3      # 남은 경로 길이를 정할 때 쓰는 최소
 PASS_HISTORY = 10            # 존 통과 시간 평균에 쓰는 최근 통과 수 (배정 스냅샷 avg_pass_s)
 ENTRY_WINDOW = 180.0         # 존 진입 시각을 이 시간(초)만큼 기억한다 (entries_1m/3m)
 BEFORE_WAIT = ("대기 node 사용 중", "대기 node 주변 확인 대기")
+GRID_STEPS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
+PASS_THROUGH_DISTANCE = 1.5  # m. 줄 맨 앞 로봇이 대기 node 에 이만큼 가까워지면 서지 않고 존에 들어가게 허가한다
+STOP_CLEARANCE = 0.12  # 도착 허용 오차를 포함해 임시 정차 위치가 경계 밖에 있도록 한다.
 
 
 def find_cycles(edges):
@@ -105,8 +110,36 @@ def radius(state):
     return math.hypot(state.width, state.length) / 2 + 0.1
 
 
+def straight_crosses(box, start, end, margin):
+    """회전 사각형의 차체 여유까지 포함해 직선 이동을 검사한다."""
+    cx, cy, ux, uy, hw, hh = box
+    lo, hi = 0.0, 1.0
+    for ax, ay, extent in ((ux, uy, hw + margin), (-uy, ux, hh + margin)):
+        p = ax*(start.x - cx) + ay*(start.y - cy)
+        d = ax*(end.x - start.x) + ay*(end.y - start.y)
+        if not d:
+            if abs(p) > extent:
+                return False
+            continue
+        a, b = sorted(((-extent - p)/d, (extent - p)/d))
+        lo, hi = max(lo, a), min(hi, b)
+        if lo > hi:
+            return False
+    return True
+
+
+@dataclass(frozen=True)
+class AutomaticGate:
+    wait: Pose | None
+    exit: Pose | None
+    gate_id: str
+
+
 class ZonePlanner:
-    """정적 grid와 방향별 gate로 통과 순서를 고른다. 실제 경로는 로봇이 계획한다."""
+    """흰 픽셀 위 최단 경로가 지나는 존으로 통과 순서를 고른다. 실제 경로는 로봇이 계획한다.
+
+    존은 경로 탐색에 반영하지 않는다. 벽(정적 맵의 주행 불가)과 등록된 장애물만 피한 최단 경로를 한 번
+    구하고, 그 경로가 들어가는 존을 차례로 본다."""
 
     def __init__(self, model, zones, state):
         self.model, self.zones = model, zones
@@ -123,111 +156,256 @@ class ZonePlanner:
                 y0, y1 = max(0, -dy), min(h, h - dy)
                 x0, x1 = max(0, -dx), min(w, w - dx)
                 self.free[y0:y1, x0:x1] &= grid[y0+dy:y1+dy, x0+dx:x1+dx]
+        self.automatic_zones = [zone for zone in zones if zone.automatic_gate]
         self.cache = {}
-        self.grids = {}
+        self.factor = zone_grid.coarse_factor(model.metadata.resolution)
         self.obstacles = ()           # 맵 전역 장애물 [(x, y, width, height)]. set_obstacles 로 바꾼다
         self.obstacle_margin = state.width / 2 + 0.05
+        self._walk = self._coarse_walk = None
 
     def set_obstacles(self, rects):
-        """막힌 통로를 경로 선택에 반영한다. 바뀌면 거리 캐시를 비운다."""
+        """막힌 통로를 경로 탐색에 반영한다."""
         rects = tuple(sorted((round(x, 3), round(y, 3), round(w, 3), round(h, 3)) for x, y, w, h in rects))
         if rects != self.obstacles:
             self.obstacles = rects
-            self.cache.clear()
-            self.grids.clear()
+            self._walk = self._coarse_walk = None
 
-    def mask(self, allowed):
-        if allowed not in self.grids:
+    def walkable(self):
+        """주행 가능 정밀 격자: 팽창한 흰 픽셀에서 등록 장애물(여유 포함)을 뺀 것. 존은 막지 않는다."""
+        if self._walk is None:
             free = self.free.copy()
-            m = self.model.metadata
-            yy, xx = np.ogrid[:free.shape[0], :free.shape[1]]
-            wx = m.origin_x + (xx + 0.5) * m.resolution
-            wy = m.origin_y + (yy + 0.5) * m.resolution
-            for z in self.zones:
-                if z.zone_id == allowed:
-                    continue
-                cx,cy,ux,uy,half_width,half_height = bounds(z)
-                dx,dy = wx-cx,wy-cy
-                free[(np.abs(ux*dx+uy*dy) <= half_width+self.margin)
-                     & (np.abs(-uy*dx+ux*dy) <= half_height+self.margin)] = False
             for x, y, w, h in self.obstacles:
                 hw, hh = w / 2 + self.obstacle_margin, h / 2 + self.obstacle_margin
                 p0 = self.model.world_to_pixel(x - hw, y - hh)
                 p1 = self.model.world_to_pixel(x + hw, y + hh)
                 free[max(0, p0[1]):max(0, p1[1] + 1), max(0, p0[0]):max(0, p1[0] + 1)] = False
-            self.grids[allowed] = free
-        return self.grids[allowed]
+            self._walk = free
+        return self._walk
 
-    def distance(self, a, b, allowed=None):
-        start, goal = self.model.world_to_pixel(a.x, a.y), self.model.world_to_pixel(b.x, b.y)
-        key = (start, goal, allowed)
-        if key in self.cache:
-            return self.cache[key]
-        free = self.mask(allowed)
-        h, w = free.shape
-        def ok(p):
-            return 0 <= p[0] < w and 0 <= p[1] < h and free[p[1], p[0]]
+    def _coordinates(self):
+        m = self.model.metadata
+        yy, xx = np.ogrid[:self.free.shape[0], :self.free.shape[1]]
+        return m.origin_x + (xx + 0.5) * m.resolution, m.origin_y + (yy + 0.5) * m.resolution
+
+    def _zone_cells(self, zone, margin, coordinates=None):
+        cx, cy, ux, uy, half_width, half_height = bounds(zone)
+        wx, wy = coordinates if coordinates is not None else self._coordinates()
+        dx, dy = wx - cx, wy - cy
+        return ((np.abs(ux*dx + uy*dy) <= half_width + margin)
+                & (np.abs(-uy*dx + ux*dy) <= half_height + margin))
+
+    def _walkable_at(self, p):
+        x, y = self.model.world_to_pixel(p.x, p.y)
+        walk = self.walkable()
+        return 0 <= y < walk.shape[0] and 0 <= x < walk.shape[1] and bool(walk[y, x])
+
+    def path(self, start, goal):
+        """흰 픽셀 위 start -> goal 최단 경로 [(x, y)] (양 끝은 정확한 좌표). 거친 격자에서 A* 한 번."""
+        model, f = self.model, self.factor
+        walk = self.walkable()
+        h, w = walk.shape
+        a, b = model.world_to_pixel(start.x, start.y), model.world_to_pixel(goal.x, goal.y)
         # 출발점은 장애물 바로 옆에 서 있을 수 있다 (막혀서 멈춘 로봇). 정적 맵에서 갈 수 있으면 출발은 허용한다.
-        start_ok = ok(start) or (self.obstacles and 0 <= start[0] < w and 0 <= start[1] < h
-                                 and self.free[start[1], start[0]])
-        if not start_ok or not ok(goal):
-            return math.inf
-        q, costs = [(0, 0, start)], {start: 0}
-        while q:
-            _, cost, p = heapq.heappop(q)
-            if cost != costs[p]:
+        if not (0 <= a[0] < w and 0 <= a[1] < h and self.free[a[1], a[0]]):
+            raise TrafficError("출발 위치가 주행 가능 영역(흰 픽셀) 밖입니다")
+        if not (0 <= b[0] < w and 0 <= b[1] < h and walk[b[1], b[0]]):
+            raise TrafficError("목적지가 주행 가능 영역(흰 픽셀) 밖이거나 장애물에 막혔습니다")
+        if self._coarse_walk is None:
+            self._coarse_walk = zone_grid.coarsen(walk, f)
+        grid = self._coarse_walk
+        ca, cb = (a[0] // f, a[1] // f), (b[0] // f, b[1] // f)
+        if not grid[ca[1], ca[0]]:                       # 장애물에 막힌 출발 칸만 연다
+            grid = grid.copy()
+            grid[ca[1], ca[0]] = True
+        cells = zone_grid.path(grid, ca, cb)
+        if not cells:
+            raise TrafficError("흰 픽셀 위로 목적지까지 가는 경로가 없습니다")
+        return [(start.x, start.y)] + [self._cell_point(c, walk) for c in cells[1:-1]] + [(goal.x, goal.y)]
+
+    def _cell_point(self, cell, walk):
+        """거친 칸 안에서 주행 가능한 정밀 픽셀 중 칸 중심에 가장 가까운 점 (대기·퇴장 node 후보가 된다)."""
+        f = self.factor
+        x0, y0 = cell[0] * f, cell[1] * f
+        block = walk[y0:y0 + f, x0:x0 + f]
+        if not block.any():
+            block = self.free[y0:y0 + f, x0:x0 + f]
+        ys, xs = np.nonzero(block) if block.any() else (np.array([f // 2]), np.array([f // 2]))
+        c = (f - 1) / 2
+        k = int(np.argmin((xs - c) ** 2 + (ys - c) ** 2))
+        return self.model.pixel_to_world(x0 + int(xs[k]), y0 + int(ys[k]))
+
+    def _spans(self, points):
+        """경로가 들어가는 존 구간 [(zone, 첫 표본, 끝 표본)]과 표본 좌표·꼭짓점 표시.
+
+        gate 가 있는 존은 차체 여유(margin)만, 노드 없는 존은 정차 여유(STOP_CLEARANCE)까지 더해 판정한다."""
+        step = self.model.metadata.resolution
+        xs, ys, vertex = [points[0][0]], [points[0][1]], [True]
+        for (ax, ay), (bx, by) in zip(points, points[1:]):
+            n = max(1, math.ceil(math.hypot(bx - ax, by - ay) / step))
+            t = np.arange(1, n + 1) / n
+            xs.extend(ax + (bx - ax) * t)
+            ys.extend(ay + (by - ay) * t)
+            vertex.extend([False] * (n - 1) + [True])
+        xs, ys = np.array(xs), np.array(ys)
+        labels = np.full(len(xs), -1)
+        for k, zone in enumerate(self.zones):
+            margin = self.margin + (0 if zone.gates else STOP_CLEARANCE)
+            inside = self._zone_cells(zone, margin, (xs, ys))
+            if (inside & (labels >= 0)).any():
+                raise TrafficError("경로가 겹치거나 맞닿은 점유 존을 지나 대기 위치를 둘 수 없습니다")
+            labels[inside] = k
+        spans, i = [], 0
+        while i < len(labels):
+            if labels[i] < 0:
+                i += 1
                 continue
-            if p == goal:
-                self.cache[key] = cost * self.model.metadata.resolution
-                return self.cache[key]
-            for dx, dy in ((1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)):
-                n = p[0]+dx, p[1]+dy
-                if not ok(n) or (dx and dy and (not ok((p[0]+dx,p[1])) or not ok((p[0],p[1]+dy)))):
-                    continue
-                nc = cost + math.hypot(dx, dy)
-                if nc < costs.get(n, math.inf):
-                    costs[n] = nc
-                    heapq.heappush(q, (nc+math.hypot(n[0]-goal[0], n[1]-goal[1]), nc, n))
-        self.cache[key] = math.inf
-        return math.inf
+            first = i
+            while i + 1 < len(labels) and labels[i + 1] == labels[i]:
+                i += 1
+            spans.append((self.zones[labels[i]], first, i))
+            i += 1
+        return spans, xs, ys, vertex
 
     def route(self, start, goal):
-        # 존 내부 목적지는 장기 점유·재출발 규칙이 필요하므로 첫 버전에서는 거절한다.
-        if any(intersects(bounds(z), p, self.margin) for z in self.zones for p in (start, goal)):
-            raise TrafficError("점유 존 내부·경계에는 작업 시작점이나 목적지를 둘 수 없습니다")
-        gates = [(z, g) for z in self.zones for g in z.gates]
-        points = [start, goal] + [p for _, g in gates for p in (g.wait, g.exit)]
-        # 출발/출구 -> 목적지/대기 node는 모든 존을 막고, gate 통과만 해당 존을 연다.
-        graph = {i: [] for i in range(len(points))}
-        for i in [0] + list(range(3, len(points), 2)):
-            for j in [1] + list(range(2, len(points), 2)):
-                d = self.distance(points[i], points[j])
-                if math.isfinite(d):
-                    graph[i].append((j, d, None))
-        for k, (z, g) in enumerate(gates):
-            if any(intersects(bounds(other), p, self.margin) for other in self.zones for p in (g.wait, g.exit)):
+        """start -> goal 이 지나는 [(존, gate)] 순서.
+
+        - gate 가 지정된 존: 경로 진행 방향과 같은 방향 gate 중 경로의 진입·퇴장 점에 가까운 것을 고르고,
+          그 출구에서 경로를 다시 구한다.
+        - 노드 없는 존: 경로가 존에 들어가기 직전·나온 직후 꼭짓점을 대기·퇴장 node 로 쓴다
+          (출발이 존 안이면 대기 없음, 목적지가 존 안이면 퇴장 없음). 두 존 사이에 꼭짓점이 없으면
+          사이 구간 가운데 점을 쓴다.
+        - gate 존이라도 출발점이나 목적지가 그 안(경계 포함)이면 이 경로에서는 노드 없는 존처럼 다룬다.
+          gate 의 대기·출구 node 는 존을 끝까지 통과할 때만 뜻이 있어서다 (존 안 상차지점 등)."""
+        resident = {id(z) for z in self.zones if z.gates
+                    and any(intersects(bounds(z), p, self.margin) for p in (start, goal))}
+        crossings, origin = [], start
+        for _ in range(sum(len(z.gates) for z in self.zones) + 1):
+            points = self.path(origin, goal)
+            spans, xs, ys, vertex = self._spans(points)
+            restart = None
+            for k, (zone, first, last) in enumerate(spans):
+                low = spans[k - 1][2] if k else -1                   # 이전 존 구간의 끝 표본
+                high = spans[k + 1][1] if k + 1 < len(spans) else len(xs)
+                if zone.gates and id(zone) not in resident:
+                    gate = self._pick_gate(zone, (xs[max(first - 1, 0)], ys[max(first - 1, 0)]),
+                                           (xs[min(last + 1, len(xs) - 1)], ys[min(last + 1, len(xs) - 1)]))
+                    crossings.append((zone, gate))
+                    restart = gate.exit
+                    break
+                before = next((j for j in range(first - 1, low, -1) if vertex[j]), None)
+                after = next((j for j in range(last + 1, high) if vertex[j]), None)
+                # 두 존을 직선으로 연달아 지나 사이에 꺾임점이 없으면 사이 구간 가운데 표본을 쓴다.
+                # 존 구간 사이 표본은 양쪽 존의 여유 밖이라 그 자리에 서도 어느 존도 침범하지 않는다.
+                if first > 0 and before is None and first - low > 1:
+                    before = (low + first) // 2
+                if last + 1 < len(xs) and after is None and high - last > 1:
+                    after = (last + high) // 2
+                if (first > 0 and before is None) or (last + 1 < len(xs) and after is None):
+                    raise TrafficError("노드 없는 점유구역 앞뒤에 대기·퇴장 위치를 둘 공간이 없습니다")
+                # 출발점 바로 앞이 존이면 대기 위치로 움직이지 않고 출발점에서 허가를 받는다.
+                wait = self._pose(xs, ys, before, first) if before not in (None, 0) else None
+                exit_pose = self._pose(xs, ys, after, last) if after is not None else None
+                wx, wy = self.model.world_to_pixel(wait.x, wait.y) if wait else (-1, -1)
+                crossings.append((zone, AutomaticGate(wait, exit_pose, f"auto-{wx}-{wy}")))
+            if restart is None:
+                return crossings
+            origin = restart
+        raise TrafficError("gate 를 지나도 목적지 경로가 점유 존을 다시 지납니다")
+
+    @staticmethod
+    def _pose(xs, ys, index, toward):
+        """꼭짓점 index 의 자세. 대기는 존 쪽, 퇴장은 진행 방향을 본다."""
+        x, y, qx, qy = xs[index], ys[index], xs[toward], ys[toward]
+        theta = math.atan2(qy - y, qx - x) if toward > index else math.atan2(y - qy, x - qx)
+        return Pose(x=float(x), y=float(y), theta=theta)
+
+    def _pick_gate(self, zone, entry, leave):
+        """경로 진행 방향(entry -> leave)과 같은 방향이고 대기·출구 node 가 주행 가능한 gate 중 가장 가까운 것."""
+        heading = (leave[0] - entry[0], leave[1] - entry[1])
+        best = None
+        for gate in zone.gates:
+            w, e = gate.wait, gate.exit
+            if (e.x - w.x) * heading[0] + (e.y - w.y) * heading[1] <= 0:
                 continue
-            d = self.distance(g.wait, g.exit, z.zone_id)
-            if math.isfinite(d):
-                graph[2+2*k].append((3+2*k, d, k))
-        q, dist, prev = [(0, 0)], {0: 0}, {}
-        while q:
-            cost, i = heapq.heappop(q)
-            if cost != dist[i]:
+            if not (self._walkable_at(w) and self._walkable_at(e)):
                 continue
-            if i == 1:
-                crossings = []
-                while i:
-                    source, gate = prev[i]
-                    if gate is not None:
-                        crossings.append(gates[gate])
-                    i = source
-                return list(reversed(crossings))
-            for j, d, gate in graph[i]:
-                if cost+d < dist.get(j, math.inf):
-                    dist[j], prev[j] = cost+d, (i, gate)
-                    heapq.heappush(q, (cost+d, j))
-        raise TrafficError("점유 존 대기·출구 node를 통한 안전한 경로가 없습니다")
+            if any(intersects(bounds(other), p, self.margin) for other in self.zones for p in (w, e)):
+                continue
+            cost = math.hypot(w.x - entry[0], w.y - entry[1]) + math.hypot(e.x - leave[0], e.y - leave[1])
+            if best is None or cost < best[0]:
+                best = (cost, gate)
+        if best is None:
+            raise TrafficError("점유 존 대기·출구 node를 통한 안전한 경로가 없습니다")
+        return best[1]
+
+    def leaves_room(self, zone, source, exit_pose, waiting, clearance):
+        """대기 로봇이 정차해도 점유 로봇이 퇴장할 수 있는지 확인한다."""
+        model = self.model
+        start = model.world_to_pixel(source.x, source.y)
+        if not model.in_bounds(source.x, source.y):
+            return False
+        goal = None
+        if exit_pose is not None:
+            if not model.in_bounds(exit_pose.x, exit_pose.y):
+                return False
+            goal = model.world_to_pixel(exit_pose.x, exit_pose.y)
+        key = ("egress", zone.zone_id, start, goal, waiting.x, waiting.y, clearance)
+        if key not in self.cache:
+            wx, wy = self._coordinates()
+            # 경계 주변에서 퇴장할 여유를 확인한다. 우회가 너무 멀면 접근 전에 기다리게 한다.
+            points = [*zone.polygon, source, waiting]
+            if exit_pose is not None:
+                points.append(exit_pose)
+            pad = 2*clearance + model.metadata.resolution
+            x0, y0 = model.world_to_pixel(min(p.x for p in points) - pad, min(p.y for p in points) - pad)
+            x1, y1 = model.world_to_pixel(max(p.x for p in points) + pad, max(p.y for p in points) + pad)
+            x0, y0 = max(0, x0), max(0, y0)
+            xs, ys = slice(x0, x1 + 1), slice(y0, y1 + 1)
+            wx, wy = wx[:, xs], wy[ys, :]
+            free = self.free[ys, xs] & ((wx - waiting.x)**2 + (wy - waiting.y)**2 > clearance**2)
+            for other in self.zones:
+                if other.zone_id != zone.zone_id:
+                    free[self._zone_cells(other, self.margin, (wx, wy))] = False
+            escape = None
+            if goal is None:
+                # 이후 작업의 목적지가 아직 없다. 대기 로봇 쪽에서도 그 차체를
+                # 완전히 지나갈 공간이 남는 경우에만 경계 앞 대기를 허용한다.
+                cx, cy, ux, uy, hw, hh = bounds(zone)
+                dx, dy = waiting.x - cx, waiting.y - cy
+                u, v = ux*dx + uy*dy, -uy*dx + ux*dy
+                ax, ay, projection = (ux, uy, u) if abs(u) - hw >= abs(v) - hh else (-uy, ux, v)
+                side = 1 if projection >= 0 else -1
+                escape = free & (side*(ax*(wx-waiting.x) + ay*(wy-waiting.y)) > clearance)
+            else:
+                goal = goal[0] - x0, goal[1] - y0
+            x, y = start[0] - x0, start[1] - y0
+            self.cache[key] = bool(free[y, x] and _reachable(free, (x, y), goal, escape=escape))
+        return self.cache[key]
+
+
+def _reachable(free, start, goal=None, *, escape=None):
+    """free(bool) 격자에서 start 로부터 goal 또는 escape 칸에 닿을 수 있는가 (8방향, 모서리 끼어들기 금지)."""
+    height, width = free.shape
+    queue, costs = [(0, 0, start)], {start: 0}
+    while queue:
+        _, cost, point = heapq.heappop(queue)
+        if cost != costs[point]:
+            continue
+        x, y = point
+        if point == goal or (escape is not None and escape[y, x]):
+            return True
+        for dx, dy in GRID_STEPS:
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < width and 0 <= ny < height) or not free[ny, nx]:
+                continue
+            if dx and dy and not (free[y, nx] and free[ny, x]):
+                continue
+            total = cost + math.hypot(dx, dy)
+            if total < costs.get((nx, ny), math.inf):
+                costs[(nx, ny)] = total
+                heuristic = math.hypot(nx - goal[0], ny - goal[1]) if goal else 0
+                heapq.heappush(queue, (total + heuristic, total, (nx, ny)))
+    return False
 
 
 class TrafficController:
@@ -403,10 +581,13 @@ class TrafficController:
                            for a in self.registry.get_site(site).robots.values())
             if lease:
                 unknown |= not self.fresh(self.fleet.get(lease['robot']))
-            unauthorized = any(rid != (lease or {}).get('robot') for rid in occupants)
+            owner = (lease or {}).get('robot')
+            if z.automatic_gate and owner is None and len(occupants) == 1:
+                owner = occupants[0]
+            unauthorized = any(rid != owner for rid in occupants)
             status = 'blocked' if unknown or unauthorized else 'occupied' if occupants else 'reserved' if lease else 'free'
             zones.append({'zone_id':z.zone_id,'name':z.name,'status':status,
-                          'owner':(lease or {}).get('robot'),'occupants':occupants,
+                          'owner':owner,'occupants':occupants,
                           'door':(dict(door_id=z.door.door_id, **(self.doors.snapshot(z.door.door_id) if self.doors
                                                                   else dict(liveness='UNKNOWN', door=None)))
                                   if z.door else None)})
@@ -443,23 +624,65 @@ class TrafficController:
         obstacles = self.obstacles.rects(job.site_id, map_id) if planner else []
         nodes, crossings, sources = [], [], {}
         previous = state.pose
+        open_crossing = None
+
+        def insert(node_pose, allowed=None):
+            seq = len(nodes)
+            nodes.append(OrderNode(node_id=f"{order.order_id}-traffic-{seq}", sequence_id=seq,
+                                   released=False, position=node_pose, allowed_zone_ids=allowed or []))
+            return seq
+
         for original in order.nodes:
-            # 직선/도킹/언도킹은 우회할 수 없다. 존을 걸치는 설비는 등록 시 분리한다.
-            route = self._route(planner, previous, original.position, obstacles) if planner else []
+            goal = next_start = original.position
+            if planner and planner.automatic_zones and original.action:
+                action = original.action
+                offset = 0.0
+                if action.action_type in (ActionType.DOCK, ActionType.PARK):
+                    offset = float(action.params.get("undock_distance", 0))
+                    if action.params.get("entry", "FORWARD") == "FORWARD":
+                        offset = -offset
+                elif action.action_type == ActionType.STRAIGHT:
+                    offset = float(action.params.get("distance", 0))
+                if action.action_type in (ActionType.DOCK, ActionType.PARK, ActionType.STRAIGHT):
+                    p = original.position
+                    fixed_end = Pose(x=p.x + offset*math.cos(p.theta), y=p.y + offset*math.sin(p.theta), theta=p.theta)
+                    if any(straight_crosses(bounds(z), p, fixed_end, planner.margin + STOP_CLEARANCE)
+                           for z in planner.automatic_zones):
+                        raise TrafficError("도킹·주차·직선 동작은 노드 없는 점유구역과 분리하세요")
+                    next_start = fixed_end
+                    if action.action_type != ActionType.STRAIGHT:
+                        goal = fixed_end
+            try:
+                route = self._route(planner, previous, goal, obstacles) if planner else []
+            except TrafficError as exc:
+                # 첫 구간(로봇 위치에서 출발)이 아니면 어느 로봇을 보내도 같은 이유로 실패한다.
+                exc.robot_specific = previous is state.pose
+                raise
             for z, gate in route:
-                seq = len(nodes)
-                nodes.append(OrderNode(node_id=f"{order.order_id}-traffic-{seq}", sequence_id=seq,
-                                       released=False, position=gate.wait))
-                nodes.append(OrderNode(node_id=f"{order.order_id}-traffic-{seq+1}", sequence_id=seq+1,
-                                       released=False, position=gate.exit, allowed_zone_ids=[z.zone_id]))
-                crossings.append({"zone": z.zone_id, "gate": gate.gate_id, "wait": seq,
-                                  "exit": seq+1, "bounds": bounds(z), "done": False,
-                                  "door": z.door.door_id if z.door else None})
+                if open_crossing is None:
+                    # 대기열은 줄 끝 -> 대기 node 바로 뒤 순서로 지나간다. slots[0] 이 대기 node, slots[k] 가 k+1 번째 자리.
+                    behind = [insert(q) for q in reversed(getattr(gate, "queue", None) or [])][::-1]
+                    wait_seq = insert(gate.wait) if gate.wait else None
+                    open_crossing = {"zone": z.zone_id, "gate": gate.gate_id, "bounds": bounds(z), "done": False,
+                                     "door": z.door.door_id if z.door else None,
+                                     "wait": wait_seq, "exit": None}
+                    if behind:
+                        open_crossing["slots"] = [wait_seq, *behind]
+                    if z.automatic_gate or isinstance(gate, AutomaticGate):
+                        open_crossing["automatic"] = True
+                        if gate.wait is None:
+                            open_crossing["start"] = previous.model_dump()
+                    crossings.append(open_crossing)
+                if gate.exit is not None:
+                    open_crossing["exit"] = insert(gate.exit, [z.zone_id])
+                    open_crossing = None
             n = original.model_copy(deep=True)
             n.sequence_id, n.released = len(nodes), False
+            if open_crossing is not None:
+                n.allowed_zone_ids = [open_crossing["zone"]]
             sources[n.node_id] = original.sequence_id
             nodes.append(n)
-            previous = original.position
+            previous = next_start
         job.traffic = {"map": self.key(job.site_id, map_id), "map_id": map_id,
                        "version": version, "uid": store.map_uid(map_id), "crossings": crossings,
                        "sources": sources, "waiting": "층별 이동 허가 대기"}
@@ -467,9 +690,13 @@ class TrafficController:
 
     def _planner(self, store, site, map_id, version, zones, state):
         cache_key = (site, map_id, version, state.width, state.length)
-        if cache_key not in self.planners:
-            self.planners = {cache_key: ZonePlanner(store.load_map_model(map_id, version), zones, state)}
-        return self.planners[cache_key]
+        planner = self.planners.pop(cache_key, None)
+        if planner is None:
+            if len(self.planners) == 2:
+                self.planners.pop(next(iter(self.planners)))
+            planner = ZonePlanner(store.load_map_model(map_id, version), zones, state)
+        self.planners[cache_key] = planner
+        return planner
 
     @staticmethod
     def _route(planner, start, goal, obstacles):
@@ -494,8 +721,12 @@ class TrafficController:
         planner = self._planner(store, job.site_id, map_id, version, zones, state)
         obstacles = self.obstacles.rects(job.site_id, map_id) if with_obstacles else []
         gates, previous = [], state.pose
+        staying = None
         for goal in positions:
-            gates += [(z.zone_id, g.gate_id) for z, g in self._route(planner, previous, goal, obstacles)]
+            for zone, gate in self._route(planner, previous, goal, obstacles):
+                if staying != zone.zone_id:
+                    gates.append((zone.zone_id, None if isinstance(gate, AutomaticGate) else gate.gate_id))
+                staying = zone.zone_id if gate.exit is None else None
             previous = goal
         return gates
 
@@ -547,19 +778,57 @@ class TrafficController:
             if r is None or r.state is None or r.state.map_id is None:
                 yield None
 
-    def _clear_space(self, job, pose, margin):
+    def _clear_space(self, job, pose, margin, *, aside=True):
         for r in self._peers(job):
             if not self.fresh(r) or math.hypot(r.state.pose.x-pose.x, r.state.pose.y-pose.y) <= margin+radius(r.state):
-                if r is not None and r.state is not None and r.available_for_job(self.fleet.stale_after):
+                if r is not None and r.state is not None:
+                    job.traffic["blocked_by"] = r.robot_id
+                if aside and r is not None and r.available_for_job(self.fleet.stale_after):
                     # 작업 없이 서 있는 로봇이 길을 막는다 — 대기 위치로 비켜 달라고 요청해 둔다.
                     self.aside_requests.add((job.site_id, r.robot_id))
-                    job.traffic["blocked_by"] = r.robot_id
                 return False
         for lease in self.data['leases'].values():
             if lease['map'] != job.traffic['map'] or lease['robot'] == job.robot_id or 'pose' not in lease:
                 continue
             p = lease['pose']
             if math.hypot(p['x']-pose.x,p['y']-pose.y) <= margin+lease['radius']:
+                return False
+        return True
+
+    def _automatic_wait_clear(self, job, crossing, wait, waiting_radius):
+        if not self._clear_space(job, wait, waiting_radius, aside=False):
+            return False
+        t = job.traffic
+        key = t["map"]
+        relevant = [v for v in self.data["leases"].values()
+                    if v["map"] == key and v.get("zone") == crossing["zone"]
+                    and v["robot"] != job.robot_id and v.get("automatic")]
+        peers = {r.robot_id: r for r in self._peers(job) if r is not None}
+        traffic_plans = {}
+        for lease in relevant:
+            if lease["kind"] == "zone" or lease["robot"] not in traffic_plans:
+                traffic_plans[lease["robot"]] = lease
+        approaching = [(rid, peer.state, traffic_plans.get(rid),
+                        intersects(crossing["bounds"], peer.state.pose, radius(peer.state)))
+                       for rid, peer in peers.items()]
+        approaching = [entry for entry in approaching if entry[2] or entry[3]]
+        if not approaching:
+            return True
+        store = self.registry.map_store(job.site_id)
+        zones = [z for z in store.load_annotations(t["map_id"], t["version"]).zones if z.type == ZoneType.OCCUPANCY]
+        zone = next(z for z in zones if z.zone_id == crossing["zone"])
+        for rid, s, lease, inside in approaching:
+            exit_pose = lease.get("egress") if lease else None
+            if lease and lease["kind"] == "wait" and not exit_pose and not inside:
+                # 내부 목적지로 향하는 로봇은 아직 출구가 없다. 입장 후 실제 위치에서 다시 검사한다.
+                job.traffic["blocked_by"] = rid
+                return False
+            approach = lease.get("approach") if lease else None
+            source = Pose(**approach) if approach and not inside else s.pose
+            end = Pose(**exit_pose) if exit_pose else None
+            planner = self._planner(store, job.site_id, t["map_id"], t["version"], zones, s)
+            if not planner.leaves_room(zone, source, end, wait, waiting_radius + radius(s) + STOP_CLEARANCE):
+                job.traffic["blocked_by"] = rid
                 return False
         return True
 
@@ -623,13 +892,32 @@ class TrafficController:
             if s.map_id != uid:
                 continue  # 맵 변경만으로 안전한 퇴장을 증명할 수 없다
             stopped = abs(s.velocity) < 0.01 and s.order_id is None and s.state in (RobotState.IDLE, RobotState.CHARGING)
-            passed = (s.order_id == lease.get("order") and s.order_update_id >= lease.get("update", 0)
+            exit_seq = lease.get("exit")
+            passed = (exit_seq is not None and s.order_id == lease.get("order")
+                      and s.order_update_id >= lease.get("update", 0)
                       and (s.last_node_id == lease.get("exit_id")
-                           or s.last_node_sequence_id > lease.get("exit", math.inf)))
+                           or (s.last_node_sequence_id > exit_seq and
+                               (not lease.get("automatic") or s.last_node_id in
+                                {n["node_id"] for n in (j.order_snapshot or {}).get("nodes", [])}))))
+            if lease.get("automatic") and s.map_version != lease.get("version"):
+                continue
             if lease["kind"] == "zone":
                 clear = (passed or (stopped and j.status.terminal)) and not intersects(lease["bounds"], s.pose, radius(s))
+            elif lease["kind"] == "wait" and lease.get("automatic"):
+                p = lease["pose"]
+                owner = self.data["leases"].get(f'zone:{lease["map"]}:{lease["zone"]}', {})
+                admitted = (owner.get("robot") == lease["robot"] and s.order_id == owner.get("order")
+                            and s.order_id is not None and s.order_update_id >= owner["update"])
+                clear = ((passed or admitted or stopped and j.status.terminal)
+                         and math.hypot(s.pose.x-p["x"], s.pose.y-p["y"]) > radius(s) + lease["radius"])
             elif lease["kind"] == "wait":
                 clear = (passed or (stopped and j.status.terminal))
+            elif lease["kind"] == "queue":
+                # 대기열 자리: 그 node 를 지나(다음 node 도달) 차체가 자리에서 벗어났거나, 작업이 끝나 멈췄다.
+                p = lease["pose"]
+                moved_on = (s.order_id == lease["order"] and s.last_node_sequence_id > lease["seq"]
+                            and math.hypot(s.pose.x-p["x"], s.pose.y-p["y"]) > lease["radius"])
+                clear = moved_on or (stopped and j.status.terminal)
             else:
                 if s.order_id == lease.get("order") and not lease.get("ack"):
                     lease["ack"] = True
@@ -648,6 +936,163 @@ class TrafficController:
             self.save()
         self._sweep_doors()
 
+    def _can_transfer_automatic(self, lease, job, state, version):
+        if not (lease.get("automatic") and lease["robot"] == job.robot_id
+                and lease.get("version") == version and state.order_id != lease["order"]):
+            return False
+        if lease["job"] == job.job_id and lease.get("stage") != job.stage:
+            return True
+        return any(j.job_id == lease["job"] and j.status.terminal for j in self.jobs.list(job.site_id))
+
+    def _arrived_at_wait(self, job, crossing, lease, zone_busy):
+        if crossing.get("arrived"):
+            return
+        now = crossing["arrived"] = time.time()
+        if self.events is not None:
+            reserved = lease.get("at") if lease else None
+            self.events.record("traffic.at_wait", site_id=job.site_id, robot_id=job.robot_id,
+                               job_id=job.job_id, ts=now, zone_id=crossing["zone"], gate_id=crossing["gate"],
+                               approach_s=round(now - reserved, 2) if reserved else None, zone_busy=zone_busy)
+
+    def _yield_floor_at_automatic_zone(self, job, order, state):
+        """정지한 후속 로봇이 유일한 층 허가를 잡고 내부 로봇의 퇴장을 막지 않게 한다."""
+        t = job.traffic
+        crossing = self._current(job)
+        if (crossing is None or not crossing.get("automatic") or crossing["wait"] is None
+                or state.order_id != order.order_id or state.order_update_id != order.order_update_id
+                or state.sub_state != BusySubState.WAITING or abs(state.velocity) >= 0.01):
+            return False
+        frontier = next((n for n in reversed(order.nodes) if n.released), None)
+        if frontier is not None and (frontier.sequence_id > crossing["wait"] or state.last_node_id != frontier.node_id):
+            return False
+        leases = self.data["leases"]
+        if any(v["kind"] == "zone" and v["map"] == t["map"] and v["robot"] == job.robot_id
+               for v in leases.values()):
+            return False
+        owner = leases.get(f'zone:{t["map"]}:{crossing["zone"]}')
+        if owner is None and self._zone_clear(job, crossing):
+            return False
+        wait = order.nodes[crossing["wait"]]
+        wait_lease = leases.get(f'wait:{t["map"]}:{crossing["zone"]}:{crossing["gate"]}')
+        at_wait = (frontier is wait
+                   and math.hypot(state.pose.x - wait.position.x, state.pose.y - wait.position.y) < 0.08)
+        if at_wait:
+            self._arrived_at_wait(job, crossing, wait_lease, owner is not None)
+        elif self._automatic_wait_clear(job, crossing, wait.position, radius(state)):
+            return False  # 먼저 안전한 대기점까지 접근한다.
+        key = f'floor:{t["map"]}:{job.robot_id}'
+        lease = leases.pop(key, None)
+        if lease is not None:
+            self.save()
+            self._event("traffic.release", lease, key)
+        self.set_waiting(job, "점유 존 진입 허가 대기", crossing, "at_wait" if at_wait else "before_wait")
+        return True
+
+    # -- 대기열 (gate 존) ---------------------------------------------------
+    # 자리 0 = 대기 node(kind=wait), 자리 k = 대기열 k번째 뒤(kind=queue). 로봇은 줄 끝 -> 자리 0 으로 간다.
+    # 새로 오는 로봇은 맨 뒤 점유 자리 바로 뒤를 잡고, 앞 자리가 비면 한 칸씩 당긴다 (선입선출).
+    # 지나가는 자리도 예약해 두었다가 그 node 를 지나 차체가 벗어나면 푼다 (reconcile).
+
+    def _slot_keys(self, job, c):
+        base = f'{job.traffic["map"]}:{c["zone"]}:{c["gate"]}'
+        slots = c.get("slots") or [c["wait"]]
+        return slots, [f'wait:{base}'] + [f'queue:{base}:{i}' for i in range(1, len(slots))]
+
+    def _queue_step(self, job, c, order, s, end):
+        """대기열 자리를 잡거나 당긴다. 줄 맨 앞(대기 node)을 가졌으면 None, 아니면 (허가 끝 seq, 대기 이유, 단계)."""
+        leases = self.data["leases"]
+        slots, keys = self._slot_keys(job, c)
+        held = [leases.get(k) for k in keys]
+        mine = [bool(l and l["robot"] == job.robot_id and l.get("order") == order.order_id) for l in held]
+        pos = next((i for i, m in enumerate(mine) if m), None)
+        ahead = [i for i, l in enumerate(held) if l and not mine[i] and (pos is None or i < pos)]
+        target = max(ahead) + 1 if ahead else 0
+        if ahead:
+            job.traffic["blocked_by"] = held[max(ahead)]["robot"]
+        before = slots[-1] - 1        # 줄 끝 직전 node (대기열에 들어가기 전 위치)
+        if pos is None:
+            if target >= len(slots):
+                return before, "대기열 가득 참", "before_wait"
+            rival = self._queue_rival(job, c, s, order.nodes[slots[-1]].position)
+            if rival is not None:
+                job.traffic["blocked_by"] = rival
+                return before, "대기열 진입 순서 대기", "before_wait"
+        if pos is None or target < pos:
+            upto = len(slots) - 1 if pos is None else pos - 1
+            # 잡을 자리(지나갈 자리 포함)에 예약 없이 서 있는 로봇이 있으면 기다린다 (재경로·취소로 예약이 풀린 로봇 등).
+            squatter = next((r for i in range(target, upto + 1)
+                             if (r := self._standing_on(job, order.nodes[slots[i]].position, radius(s))) is not None), None)
+            if squatter is not None:
+                job.traffic["blocked_by"] = squatter
+                if pos is None:
+                    return before, "대기 node 주변 확인 대기", "before_wait"
+                return slots[pos], f"대기열 {pos + 1}번째 자리 대기", "queue"
+            now = time.time()
+            for i in range(target, upto + 1):
+                if held[i] is not None:
+                    continue
+                node = order.nodes[slots[i]]
+                leases[keys[i]] = {"map": job.traffic["map"], "robot": job.robot_id, "job": job.job_id,
+                                   "kind": "wait" if i == 0 else "queue", "at": now, "order": order.order_id,
+                                   "pose": node.position.model_dump(), "radius": radius(s), "seq": slots[i],
+                                   "node_id": node.node_id, "exit_id": end.node_id, "exit": c["exit"],
+                                   "update": order.order_update_id, "zone": c["zone"]}
+                self._event("traffic.reserve", leases[keys[i]], keys[i], zone_id=c["zone"], gate_id=c["gate"], slot=i)
+            c.setdefault("ticket", now)   # 줄에 선 시각 (이후 새로 오는 로봇의 순서 경쟁에서 빠진다)
+            self.save()
+            pos = target
+        if pos == 0:
+            return None
+        return slots[pos], f"대기열 {pos + 1}번째 자리 대기", "queue"
+
+    def _standing_on(self, job, pose, margin):
+        """예약 없이 그 자리에 서 있는 다른 로봇 (작업 없는 로봇이면 비켜 달라고 요청한다)."""
+        for r in self._peers(job):
+            if r is None or r.state is None:
+                continue
+            if math.hypot(r.state.pose.x - pose.x, r.state.pose.y - pose.y) < margin:
+                if r.available_for_job(self.fleet.stale_after):
+                    self.aside_requests.add((job.site_id, r.robot_id))
+                return r.robot_id
+        return None
+
+    def _queue_rival(self, job, c, s, entrance):
+        """같은 줄에 아직 서지 않은 다른 로봇 중 줄 끝에 더 가까운 로봇 (먼저 도착할 로봇이 먼저 선다)."""
+        mine = math.hypot(s.pose.x - entrance.x, s.pose.y - entrance.y)
+        for other in self.jobs.list(job.site_id):
+            if other.job_id == job.job_id or other.status.terminal or not other.traffic:
+                continue
+            oc = self._current(other)
+            if (oc is None or other.traffic.get("map") != job.traffic["map"]
+                    or (oc["zone"], oc["gate"]) != (c["zone"], c["gate"]) or "ticket" in oc):
+                continue
+            r = self.fleet.get(other.robot_id)
+            if not self.fresh(r):
+                continue
+            d = math.hypot(r.state.pose.x - entrance.x, r.state.pose.y - entrance.y)
+            if (d, other.job_id) < (mine, job.job_id):
+                return other.robot_id
+        return None
+
+    def _zone_turn(self, job, c):
+        """같은 존의 다른 방향 줄 맨 앞에 먼저 도착한 로봇이 있으면 양보한다 (아직 오는 중인 로봇은 기다리지 않는다)."""
+        mine = c.get("at_head", float("inf"))
+        prefix = f'wait:{job.traffic["map"]}:{c["zone"]}:'
+        for key, lease in self.data["leases"].items():
+            if not key.startswith(prefix) or lease["robot"] == job.robot_id or lease.get("automatic"):
+                continue
+            try:
+                other = self.jobs.get(lease["job"])
+            except Exception:
+                continue
+            oc = self._current(other)
+            if other.status.terminal or oc is None or oc["zone"] != c["zone"] or "at_head" not in oc:
+                continue
+            if (oc["at_head"], other.job_id) < (mine, job.job_id):
+                job.traffic["blocked_by"] = lease["robot"]
+                return False
+        return True
+
     def update(self, job):
         """기존 허가를 유지하고 대기 node/출구까지 연속해서 허가한다."""
         t = job.traffic
@@ -660,60 +1105,92 @@ class TrafficController:
         if s.map_id != t["uid"] or s.map_version != t["version"]:
             self.set_waiting(job, "맵·위치 확인 대기", phase="map")
             return None
+        order = Order.model_validate(job.order_snapshot)
+        if self.limit(job.site_id, t["map_id"]) is not None and self._yield_floor_at_automatic_zone(job, order, s):
+            return None
         if not self.acquire_floor(job, t["map_id"]):
             self.set_waiting(job, "층별 동시 이동 대수 제한", phase="floor")
             return None
-        from common.schemas import Order
-        order = Order.model_validate(job.order_snapshot)
         through = len(order.nodes)-1
         leases = self.data["leases"]
+        t.pop("blocked_by", None)
+        reached = s.last_node_id in {n.node_id for n in order.nodes}
         for c in t["crossings"]:
             if c["done"]:
                 continue
             zk = f'zone:{t["map"]}:{c["zone"]}'
             wk = f'wait:{t["map"]}:{c["zone"]}:{c["gate"]}'
-            own = leases.get(zk, {}).get("order") == order.order_id and leases.get(zk, {}).get("robot") == job.robot_id
-            passed = (s.order_id == order.order_id and s.order_update_id >= order.order_update_id
-                      and (s.last_node_id == order.nodes[c["exit"]].node_id or s.last_node_sequence_id > c["exit"]))
+            owner = leases.get(zk)
+            own = owner and owner["order"] == order.order_id and owner["robot"] == job.robot_id
+            end_seq = c["exit"] if c["exit"] is not None else len(order.nodes) - 1
+            end = order.nodes[end_seq]
+            automatic = c.get("automatic", False)
+            passed = (c["exit"] is not None and s.order_id == order.order_id
+                      and s.order_update_id >= order.order_update_id
+                      and (s.last_node_id == end.node_id or (reached and s.last_node_sequence_id > end_seq)))
             if passed and not intersects(c["bounds"], s.pose, radius(s)):
                 c["done"] = True
                 continue
             if own:
-                through = c["exit"]
+                through = end_seq
                 self.set_waiting(job, None)
                 break
-            wait = order.nodes[c["wait"]]
-            held = leases.get(wk)
-            if held and (held["robot"] != job.robot_id or held.get("order") != order.order_id):
-                through = c["wait"]-1
-                self.set_waiting(job, "대기 node 사용 중", c, "before_wait")
-                break
-            if not held:
-                if not self._clear_space(job, wait.position, radius(s)):
-                    through = c["wait"]-1
-                    self.set_waiting(job, "대기 node 주변 확인 대기", c, "before_wait")
-                    break
-                leases[wk] = {"map": t["map"], "robot": job.robot_id, "job": job.job_id,
-                              "kind": "wait", "at": time.time(), "order": order.order_id,
-                              "pose": wait.position.model_dump(), "radius": radius(s),
-                              "exit_id": order.nodes[c["exit"]].node_id, "exit": c["exit"], "update": order.order_update_id}
-                self.save()
-                self._event("traffic.reserve", leases[wk], wk, zone_id=c["zone"], gate_id=c["gate"])
-            at_wait = (s.order_id == order.order_id and s.last_node_id == wait.node_id
-                       and abs(s.velocity) < 0.01 and math.hypot(s.pose.x-wait.position.x,s.pose.y-wait.position.y) < 0.08)
-            if at_wait and not c.get("arrived"):
-                # 대기 node 에 처음 멈춘 시각. 존 대기 시간(학습 라벨)은 여기서 진입 허가까지다.
-                c["arrived"] = time.time()
-                if self.events is not None:
-                    reserved = leases.get(wk, {}).get("at")
-                    self.events.record("traffic.at_wait", site_id=job.site_id, robot_id=job.robot_id,
-                                       job_id=job.job_id, ts=c["arrived"], zone_id=c["zone"], gate_id=c["gate"],
-                                       approach_s=round(c["arrived"] - reserved, 2) if reserved else None,
-                                       zone_busy=zk in leases)
-            end = order.nodes[c["exit"]]
+            wait = order.nodes[c["wait"]] if c["wait"] is not None else None
             door = c.get("door")
-            ready = (at_wait and zk not in leases and self._zone_clear(job, c)
-                     and self._clear_space(job, end.position, radius(s)))
+            if wait is not None and not automatic:
+                step = self._queue_step(job, c, order, s, end)
+                if step is not None:                  # 대기열 뒤쪽 자리에서 앞 로봇을 기다린다
+                    through, reason, phase = step
+                    self.set_waiting(job, reason, c, phase)
+                    break
+                at_wait = (s.order_id == order.order_id and s.last_node_id == wait.node_id
+                           and abs(s.velocity) < 0.01 and math.hypot(s.pose.x-wait.position.x, s.pose.y-wait.position.y) < 0.08)
+            elif wait is not None:
+                held = leases.get(wk)
+                transfer = held and self._can_transfer_automatic(held, job, s, t["version"])
+                if held and not transfer and (held["robot"] != job.robot_id or held.get("order") != order.order_id):
+                    through = c["wait"]-1
+                    self.set_waiting(job, "대기 node 사용 중", c, "before_wait")
+                    break
+                if not held or transfer:
+                    clear = (self._automatic_wait_clear(job, c, wait.position, radius(s)) if automatic
+                             else self._clear_space(job, wait.position, radius(s)))
+                    if not clear:
+                        through = c["wait"]-1
+                        self.set_waiting(job, "대기 node 주변 확인 대기", c, "before_wait")
+                        break
+                    leases[wk] = {"map": t["map"], "robot": job.robot_id, "job": job.job_id,
+                                  "kind": "wait", "at": time.time(), "order": order.order_id,
+                                  "pose": wait.position.model_dump(), "radius": radius(s),
+                                  "exit_id": end.node_id, "exit": c["exit"], "update": order.order_update_id}
+                    if automatic:
+                        leases[wk].update(automatic=True, zone=c["zone"], version=t["version"], stage=job.stage,
+                                          approach=wait.position.model_dump(),
+                                          egress=end.position.model_dump() if c["exit"] is not None else None)
+                    self.save()
+                    self._event("traffic.reserve", leases[wk], wk, zone_id=c["zone"], gate_id=c["gate"])
+                at_wait = (s.order_id == order.order_id and s.last_node_id == wait.node_id
+                           and abs(s.velocity) < 0.01 and math.hypot(s.pose.x-wait.position.x, s.pose.y-wait.position.y) < 0.08)
+            else:
+                # 이미 안에 있는 로봇이 다음 작업을 받으면 같은 존에서 퇴장할 수 있다.
+                origin = c.get("start")
+                near_origin = origin and math.hypot(s.pose.x - origin["x"], s.pose.y - origin["y"]) < 0.08
+                at_wait = (s.order_id in (None, order.order_id) and abs(s.velocity) < 0.01
+                           and (near_origin or intersects(c["bounds"], s.pose, radius(s) + STOP_CLEARANCE)))
+            if at_wait:
+                self._arrived_at_wait(job, c, leases.get(wk), owner is not None)
+            resident = wait is None and owner and self._can_transfer_automatic(owner, job, s, t["version"])
+            # gate 존(자동문 제외)은 줄 맨 앞(대기 node 예약)이고 대기 node 에 PASS_THROUGH_DISTANCE 안으로 왔으면
+            # 서기 전에도 진입을 허가한다. 존이 비어 있으면 먼저 온 로봇은 멈추지 않고 지나간다.
+            # 멀리서 미리 잡지 않는다 (가는 동안 존을 묶어 두고, 장애물에 막혀도 재경로할 수 없게 된다).
+            # 자동문은 진입점에서 문을 열어야 하므로 선다.
+            head = (wait is not None and not automatic and not door
+                    and math.hypot(s.pose.x - wait.position.x, s.pose.y - wait.position.y) <= PASS_THROUGH_DISTANCE)
+            if (at_wait or head) and not automatic:
+                c.setdefault("at_head", time.time())   # 줄 맨 앞에 도착한 시각. 다른 방향 줄과 진입 순서를 가린다
+            ready = ((at_wait or head) and (not owner or resident) and self._zone_clear(job, c)
+                     and self._clear_space(job, end.position, radius(s), aside=not automatic)
+                     and (automatic or self._zone_turn(job, c)))
             if ready and door:
                 # 자동문: 대기(진입) node 에서 열림 신호를 보내고, 열린 것을 확인해야 존에 들어간다.
                 if not self._door_open(job, door):
@@ -726,15 +1203,19 @@ class TrafficController:
                               "pose": end.position.model_dump(), "radius": radius(s),
                               "exit_id": end.node_id, "exit": c["exit"], "bounds": c["bounds"],
                               "update": order.order_update_id+1, "door": door}
+                if automatic:
+                    leases[zk].update(automatic=True, zone=c["zone"], version=t["version"], stage=job.stage,
+                                      approach=(wait.position if wait else s.pose).model_dump(),
+                                      egress=end.position.model_dump() if c["exit"] is not None else None)
                 self.save()
                 now = leases[zk]["at"]
                 self._event("traffic.reserve", leases[zk], zk, zone_id=c["zone"], gate_id=c["gate"],
                             queued_s=round(now - c["arrived"], 2) if c.get("arrived") else None)
                 self._zone_entered(zk, now)
-                through = c["exit"]
+                through = end_seq
                 self.set_waiting(job, None)
             else:
-                through = c["wait"]
+                through = c["wait"] if wait is not None else -1
                 self.set_waiting(job, "점유 존 진입 허가 대기", c, "at_wait" if at_wait else "approach")
             break
         else:
@@ -784,10 +1265,13 @@ class TrafficController:
                     elif waiting == "점유 존 진입 허가 대기":
                         if zone_key in leases:
                             add(job, leases[zone_key]["robot"], zone_key)
+                        add(job, t.get("blocked_by"), zone_key)   # 노드 없는 존의 퇴장 공간·다른 방향 줄의 선착 로봇
                         for r in self.fleet.all():
                             if (r.state and r.state.map_id == t.get("uid")
                                     and intersects(current["bounds"], r.state.pose, radius(r.state))):
                                 add(job, r.robot_id, zone_key)
+                    elif waiting.startswith("대기열"):
+                        add(job, t.get("blocked_by"), wait_key)   # 바로 앞 자리 로봇 / 줄에 먼저 설 로봇
                     elif waiting == "대기 node 주변 확인 대기":
                         add(job, t.get("blocked_by"), wait_key)
                         for resource, lease in leases.items():

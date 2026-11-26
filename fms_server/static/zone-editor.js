@@ -14,6 +14,11 @@ window.zoneEditor = (() => {
   let gates = [];
   // 자동문: 진입점 A·B. 사용자가 고치기 전(doorTouched=false)에는 구역 모양에서 기본 위치를 계산해 보여 준다.
   let doorNodes = null, doorTouched = false;
+  // 구역 복사: 원본 구역 기준 node 의 상대 위치. 복사본을 옮기거나 돌리면 node 가 따라간다 (null 이면 고정).
+  let anchors = null;
+  // 맵 클릭으로 node 찍기: {gate: 번호, key: 'wait'|'exit'|'queue'} 또는 {door: 'a'|'b'} (자동문 대기열). null 이면 꺼짐.
+  let placing = null;
+  let doorQueues = {a: [], b: []};   // 자동문 A·B 쪽 대기열 (진입점 바로 뒤부터 줄 끝까지)
   const DOOR_OFFSET = 0.8;   // 서버 api/zones.py DOOR_NODE_OFFSET 과 같다
   const doorKeys = ['doorAx', 'doorAy', 'doorBx', 'doorBy'];
   const field = name => form.elements.namedItem(name);
@@ -63,6 +68,9 @@ window.zoneEditor = (() => {
   }
   function hint() {
     if (busy) return '맵을 저장하고 있습니다…';
+    if (placing) return placing.key === 'queue' || placing.door
+      ? '맵을 클릭할 때마다 대기열 자리가 줄 끝에 붙습니다. 대기 node 에서 진입 반대쪽으로 한 줄로 찍고, 끝나면 [찍기 끝]을 누르세요.'
+      : `맵에서 ${placing.key === 'wait' ? '대기' : '출구'} node 위치를 클릭하세요. Esc 로 취소합니다.`;
     if (pickup && step === 'node') return node
       ? '클릭해 픽업 지점을 옮기거나, 드래그·숫자 입력으로 로봇 방향을 조절하세요. 구역 밖도 됩니다.'
       : '로봇이 정지해 적재할 위치를 클릭하고, 드래그해 방향을 정하세요.';
@@ -76,6 +84,7 @@ window.zoneEditor = (() => {
   // 일방통행 통로 = 진입 방향(gate)이 하나뿐인 점유 존. 저장 형식은 점유 존과 같다 (새 로직 없음).
   const oneway = () => field('type').value === 'oneway';
   const occupancy = () => ['occupancy', 'oneway'].includes(field('type').value);
+  const automatic = () => field('type').value === 'occupancy_auto';
   const autodoor = () => !pickup && field('type').value === 'autodoor';
   function defaultDoorNodes() {
     if (!rect) return null;
@@ -102,6 +111,8 @@ window.zoneEditor = (() => {
     }
     if (!pickup) $('#zoneDescription').textContent = autodoor()
       ? '문 구역을 지나는 경로에 자동문 통과 단계가 들어갑니다. 한 대씩 통과하고, 진입점에서 문 열림 신호를 보냅니다. 저장하면 새 맵 버전을 로봇에 전달합니다.'
+      : automatic()
+      ? '구역에 로봇이 있으면 다음 로봇은 경계 밖에서 기다립니다. 대기 위치는 작업마다 자동으로 정합니다.'
       : occupancy()
       ? (oneway() ? '대기 node 에서 출구 node 방향으로만, 한 대씩 통과합니다. 반대 방향 진입로는 만들지 않습니다. 저장하면 새 맵 버전을 로봇에 전달합니다.'
         : '한 대씩 통과합니다. 대기·출구는 차체 여유를 두고 배치하세요. 저장하면 새 맵 버전을 로봇에 전달합니다.')
@@ -135,7 +146,8 @@ window.zoneEditor = (() => {
     $('#zoneHint').textContent = hint();
   }
   function cancel() {
-    active = false; rect = null; gesture = null; node = null; ret = null; nodeGesture = null; pickup = false;
+    active = false; rect = null; gesture = null; node = null; ret = null; nodeGesture = null; pickup = false; anchors = null;
+    placing = null;
     panel.hidden = true;
     canvas.classList.remove('zone-drawing');
     $('#addZone').classList.remove('active');
@@ -150,11 +162,11 @@ window.zoneEditor = (() => {
     return true;
   }
   function start(zone = null, station = null, asPickup = false) {
-    if (!view.image) { notify('먼저 활성 맵을 선택하세요.'); return; }
-    if (!canLeave()) return;
-    if (window.pointEditor && !window.pointEditor.canLeave()) return;
+    if (!view.image) { notify('먼저 활성 맵을 선택하세요.'); return false; }
+    if (!canLeave()) return false;
+    if (window.pointEditor && !window.pointEditor.canLeave()) return false;
     pickup = asPickup || !!station || zone?.type === 'pickup';
-    active = true; zoneId = zone?.zone_id || null; baseVersion = view.version;
+    active = true; zoneId = zone?.zone_id || null; baseVersion = view.version; anchors = null; placing = null;
     rect = zone ? rectangle(zone.polygon) : null;
     node = station?.node ? {...station.node} : null;
     ret = station?.return_node ? {...station.return_node} : null;
@@ -164,10 +176,16 @@ window.zoneEditor = (() => {
     gates = structuredClone(zone?.door ? [] : zone?.gates || []);
     doorNodes = zone?.door ? {a: {...zone.door.node_a}, b: {...zone.door.node_b}} : null;
     doorTouched = !!zone?.door;
+    gates.forEach(g => { g.queue = g.queue || []; });
+    doorQueues = {a: (zone?.door?.queue_a || []).map(p => ({x: p.x, y: p.y})),
+                  b: (zone?.door?.queue_b || []).map(p => ({x: p.x, y: p.y}))};
     renderGates();
+    renderDoorQueues();
     field('name').value = station?.name || zone?.name || '';
     if (zone?.speed_limit) field('speedLimit').value = zone.speed_limit;
-    field('type').value = pickup ? 'prohibit' : zone?.door ? 'autodoor' : zone?.type === 'occupancy' && gates.length === 1 ? 'oneway' : (zone?.type || 'prohibit');
+    field('type').value = pickup ? 'prohibit' : zone?.door ? 'autodoor'
+      : zone?.type === 'occupancy' && !gates.length ? 'occupancy_auto'
+      : zone?.type === 'occupancy' && gates.length === 1 ? 'oneway' : (zone?.type || 'prohibit');
     field('doorId').value = zone?.door?.door_id || '';
     if (zone?.door) {
       field('doorAx').value = Number(zone.door.node_a.x.toFixed(3)); field('doorAy').value = Number(zone.door.node_a.y.toFixed(3));
@@ -193,7 +211,99 @@ window.zoneEditor = (() => {
     $(pickup ? '#addPickupStation' : '#addZone').classList.add('active');
     sync(); draw();
     if (!field('name').disabled) field('name').focus();
+    return true;
   }
+  // 선택한 구역과 같은 종류·크기·회전·node 배치로 새 구역을 연다. 원본과 겹치지 않게 옆에 놓고, 사용자가 옮겨서 저장한다.
+  function copy(zone) {
+    const source = rectangle(zone.polygon);
+    if (!source) { notify('사각형 구역만 복사할 수 있습니다.'); return; }
+    if (!start(zone)) return;
+    zoneId = null;
+    field('name').value = `${zone.name || zone.zone_id} 복사`;
+    field('doorId').value = '';   // 비우면 서버가 새 zone_id 를 문 id 로 쓴다
+    gates = gates.map(g => ({...g, gate_id: `gate-${Date.now()}-${Math.random().toString(16).slice(2)}`}));
+    const rot = source.rotation * Math.PI / 180;
+    const pin = pose => pose && {...geometry.local(pose, source), theta: (pose.theta || 0) - rot};
+    anchors = {gates: gates.map(g => ({wait: pin(g.wait), exit: pin(g.exit), queue: g.queue.map(pin)})),
+               door: doorNodes && {a: pin(doorNodes.a), b: pin(doorNodes.b)},
+               doorQueues: {a: doorQueues.a.map(pin), b: doorQueues.b.map(pin)}};
+    // node 까지 포함한 외곽 크기만큼 옆으로 옮긴다. 맵 밖이면 반대쪽·아래·위 순서로 시도한다.
+    const pts = [...geometry.corners(source), ...gates.flatMap(g => [g.wait, g.exit, ...g.queue]),
+                 ...(doorNodes ? [doorNodes.a, doorNodes.b] : []), ...doorQueues.a, ...doorQueues.b].filter(Boolean);
+    const w = Math.max(...pts.map(p => p.x)) - Math.min(...pts.map(p => p.x)) + 0.5;
+    const h = Math.max(...pts.map(p => p.y)) - Math.min(...pts.map(p => p.y)) + 0.5;
+    const placed = [[w, 0], [-w, 0], [0, h], [0, -h]].map(([dx, dy]) => ({...source, x: source.x + dx, y: source.y + dy}))
+      .find(r => geometry.fits(r, bounds()));
+    if (placed) rect = placed;
+    follow();
+    renderGates();
+    renderDoorQueues();
+    $('#zoneEditorTitle').textContent = '구역 복사';
+    sync(); draw();
+    notify(placed ? '복사본을 원하는 위치로 옮긴 뒤 저장하세요. 대기·출구·문 node 도 함께 움직입니다.'
+                  : '복사본이 원본과 겹칩니다. 원하는 위치로 옮긴 뒤 저장하세요.');
+  }
+  // 복사 중이면 node 를 구역의 이동·회전에 맞춰 다시 놓는다.
+  function follow() {
+    if (!anchors || !rect) return;
+    const rot = rect.rotation * Math.PI / 180;
+    const place = a => a && {...geometry.world(a, rect), theta: wrap(a.theta + rot)};
+    gates.forEach((g, i) => {
+      const a = anchors.gates[i];
+      if (!a) return;
+      if (a.wait) g.wait = place(a.wait);
+      if (a.exit) g.exit = place(a.exit);
+      a.queue.forEach((q, k) => { if (q) g.queue[k] = place(q); });
+    });
+    for (const side of ['a', 'b'])
+      anchors.doorQueues[side].forEach((q, k) => { if (q) { const w = place(q); doorQueues[side][k] = {x: w.x, y: w.y}; } });
+    if (anchors.door && doorNodes) {
+      const a = place(anchors.door.a), b = place(anchors.door.b);
+      doorNodes = {a: {x: a.x, y: a.y}, b: {x: b.x, y: b.y}};
+      doorKeys.forEach((k, i) => { field(k).value = Number([a.x, a.y, b.x, b.y][i].toFixed(3)); });
+    }
+  }
+  // 찍은 대기·출구 node 의 방향은 대기 -> 출구 진행 방향으로 맞춘다 (목적지에서 고른 node 는 그 방향을 쓴다).
+  function aim(g) {
+    if (!g.wait || !g.exit) return;
+    const theta = Math.atan2(g.exit.y - g.wait.y, g.exit.x - g.wait.x);
+    if (g.wait.clicked) g.wait.theta = theta;
+    if (g.exit.clicked) g.exit.theta = theta;
+  }
+  function place(w) {
+    if (!inBounds(w)) { notify('맵 범위 안의 위치를 선택하세요.'); return; }
+    const pt = {x: Number(w.x.toFixed(3)), y: Number(w.y.toFixed(3))};
+    if (placing.door) {
+      doorQueues[placing.door].push(pt);
+      anchors?.doorQueues[placing.door].push(null);
+      renderDoorQueues();
+    } else {
+      const g = gates[placing.gate];
+      if (!g) { placing = null; return; }
+      if (placing.key === 'queue') {
+        g.queue.push({...pt, theta: 0});
+        anchors?.gates[placing.gate]?.queue.push(null);
+      } else {
+        g[placing.key] = {...pt, theta: 0, clicked: true};
+        if (anchors?.gates[placing.gate]) anchors.gates[placing.gate][placing.key] = null;
+        aim(g);
+        placing = null;
+      }
+      renderGates();
+    }
+    sync(); draw();
+  }
+  function togglePlacing(target) {
+    const same = placing && placing.gate === target.gate && placing.key === target.key && placing.door === target.door;
+    placing = same ? null : target;
+    renderGates(); renderDoorQueues(); sync();
+  }
+  // 대기열 자리의 방향: 각 자리는 앞 자리(맨 앞은 대기 node)를 본다. 서버 queue_poses 와 같다.
+  function queuePoses(points, head) {
+    let ahead = head;
+    return points.map(q => { const pose = {x: q.x, y: q.y, theta: Math.atan2(ahead.y - q.y, ahead.x - q.x)}; ahead = q; return pose; });
+  }
+  const plain = pose => pose && {x: pose.x, y: pose.y, theta: wrap(pose.theta || 0)};
   function rectangle(polygon) {
     // 벤더의 임의 다각형을 사각형으로 바꾸지 않는다.
     return geometry.fromPolygon(polygon);
@@ -206,6 +316,7 @@ window.zoneEditor = (() => {
     if (!active) return false;
     if (busy) return true;
     const p = mouse(e);
+    if (placing) { place(world(p)); return true; }
     if (nodeStep()) {
       const w = world(p);
       if (!inBounds(w)) { notify('맵 범위 안의 위치를 선택하세요.'); return true; }
@@ -251,6 +362,7 @@ window.zoneEditor = (() => {
       const candidate=geometry.resize(g.rect,g.mode,raw,min);
       if(geometry.fits(candidate,b))rect=candidate;
     }
+    follow();
     sync(); draw(); return true;
   }
   function pointerUp(e) {
@@ -272,6 +384,7 @@ window.zoneEditor = (() => {
       if(canvas.hasPointerCapture(e.pointerId))canvas.releasePointerCapture(e.pointerId);
       // 새 구역을 그린 직후에는 픽업 지점 지정으로 넘어간다.
       if (pickup && created && !node) step = 'node';
+      if (anchors) renderGates();   // 따라 움직인 node 의 저장 좌표 표시를 갱신한다
       sync(); draw();
     }
     return true;
@@ -279,7 +392,7 @@ window.zoneEditor = (() => {
   function pointerCancel() {
     if (nodeGesture) { setEditing(nodeGesture.old); nodeGesture = null; sync(); draw(); return; }
     if (!gesture) return;
-    rect=gesture.rect; gesture=null; sync(); draw();
+    rect=gesture.rect; gesture=null; follow(); sync(); draw();
   }
   function drawNode(node, color, label, current) {
     if (!node) return;
@@ -302,7 +415,7 @@ window.zoneEditor = (() => {
   }
   function drawEditor() {
     if (!active || !view.image) return;
-    const color = pickup ? PICKUP_COLOR : occupancy() || autodoor() ? '#59c8be' : field('type').value==='elevator' ? '#ab9aee' : '#f2848c';
+    const color = pickup ? PICKUP_COLOR : occupancy() || automatic() || autodoor() ? '#59c8be' : field('type').value==='elevator' ? '#ab9aee' : '#f2848c';
     if (rect) {
       const pts=geometry.corners(rect).map(point), a=pts[0];
       ctx.save(); ctx.fillStyle=color+'45'; ctx.strokeStyle=color; ctx.lineWidth=2;
@@ -328,11 +441,14 @@ window.zoneEditor = (() => {
         const ab = Math.atan2(n.b.y - n.a.y, n.b.x - n.a.x);
         drawNode({...n.a, theta: ab}, color, '문 A', false);
         drawNode({...n.b, theta: ab + Math.PI}, '#e2bd79', '문 B', false);
+        queuePoses(doorQueues.a, n.a).forEach((q, k) => drawNode(q, color, `A 줄 ${k + 2}`, false));
+        queuePoses(doorQueues.b, n.b).forEach((q, k) => drawNode(q, '#e2bd79', `B 줄 ${k + 2}`, false));
       }
     } else if (occupancy()) {
       gates.forEach((g,i) => {
         drawNode(g.wait, color, `대기 ${i+1}`, false);
         drawNode(g.exit, '#e2bd79', `출구 ${i+1}`, false);
+        if (g.wait) queuePoses(g.queue, g.wait).forEach((q, k) => drawNode(q, color, `대기 ${i+1}-줄 ${k + 2}`, false));
       });
     }
   }
@@ -355,7 +471,7 @@ window.zoneEditor = (() => {
       return;
     }
     if (['prohibit','elevator','occupancy','slow'].includes(zone.type) && rectangle(zone.polygon))
-      box.append(button('구역 편집',()=>start(zone)));
+      box.append(button('구역 편집',()=>start(zone)), button('구역 복사',()=>copy(zone)));
     box.append(button('구역 삭제',async()=>{
       if (!confirm(`'${zone.name||zone.zone_id}' 구역을 삭제하고 새 맵 버전을 적용할까요?`)) return;
       const version=view.version, url=`${mapURL()}/zones/${enc(zone.zone_id)}?base_version=${enc(version)}`;
@@ -369,7 +485,7 @@ window.zoneEditor = (() => {
     if (dimensionKeys.some(n=>field(n).value==='' || !Number.isFinite(values[n]))) return;
     if (values.width < minSize() || values.height < minSize()) return;
     if(!geometry.fits(values,bounds()))return;
-    rect=values; draw();
+    rect=values; follow(); if (anchors) renderGates(); draw();
   });
   for (const [keys, kind] of [[nodeKeys, 'node'], [returnKeys, 'return']]) for (const k of keys)
     field(k).addEventListener('input', () => {
@@ -395,15 +511,52 @@ window.zoneEditor = (() => {
           select.value = 'saved';
         }
         choices.forEach((c,i) => select.append(new Option(c.name, String(i))));
-        select.onchange = () => { gate[key] = select.value === 'saved' ? gate[key]
-          : select.value === '' ? null : {...choices[Number(select.value)].pose}; draw(); };
-        labelNode.append(select); row.append(labelNode);
+        select.onchange = () => { if (select.value !== 'saved' && anchors?.gates[index]) anchors.gates[index][key] = null;
+          gate[key] = select.value === 'saved' ? gate[key]
+          : select.value === '' ? null : {...choices[Number(select.value)].pose}; aim(gate); draw(); };
+        const picking = placing?.gate === index && placing.key === key;
+        labelNode.append(select); row.append(labelNode,
+          button(picking ? '찍기 취소' : `${title} 맵에서 찍기`, () => togglePlacing({gate: index, key})));
       }
-      row.append(button('방향 삭제', () => { gates.splice(index,1); renderGates(); draw(); }));
+      const queueBox = el('div');
+      queueBox.className = 'queue-list';
+      queueBox.append(el('span', `대기열 ${gate.queue.length ? gate.queue.length + '자리 (대기 node 뒤)' : '없음'}`));
+      gate.queue.forEach((q, k) => {
+        const item = el('div', `줄 ${k + 2}: (${q.x.toFixed(2)}, ${q.y.toFixed(2)}) `);
+        item.append(button('삭제', () => { gate.queue.splice(k, 1); anchors?.gates[index]?.queue.splice(k, 1); renderGates(); draw(); }));
+        queueBox.append(item);
+      });
+      const queuing = placing?.gate === index && placing.key === 'queue';
+      queueBox.append(button(queuing ? '찍기 끝' : '대기열 자리 찍기', () => {
+        if (!gate.wait) { notify('대기 node 를 먼저 지정하세요.'); return; }
+        togglePlacing({gate: index, key: 'queue'});
+      }));
+      row.append(queueBox);
+      row.append(button('방향 삭제', () => { gates.splice(index,1); anchors?.gates.splice(index,1); placing = null; renderGates(); draw(); }));
       box.append(row);
     });
   }
+  function renderDoorQueues() {
+    const box = $('#doorQueueRows'); box.replaceChildren();
+    for (const side of ['a', 'b']) {
+      const row = el('div');
+      row.className = 'queue-list';
+      const label = side.toUpperCase();
+      row.append(el('span', `${label} 쪽 대기열 ${doorQueues[side].length ? doorQueues[side].length + '자리' : '없음'}`));
+      doorQueues[side].forEach((q, k) => {
+        const item = el('div', `${label} 줄 ${k + 2}: (${q.x.toFixed(2)}, ${q.y.toFixed(2)}) `);
+        item.append(button('삭제', () => { doorQueues[side].splice(k, 1); anchors?.doorQueues[side].splice(k, 1); renderDoorQueues(); draw(); }));
+        row.append(item);
+      });
+      row.append(button(placing?.door === side ? '찍기 끝' : `${label} 쪽 대기열 자리 찍기`, () => togglePlacing({door: side})));
+      box.append(row);
+    }
+  }
+  window.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && active && placing) { placing = null; renderGates(); renderDoorQueues(); sync(); }
+  });
   doorKeys.forEach(k => field(k).addEventListener('input', () => {
+    if (anchors) anchors.door = null;   // 직접 고친 문 node 는 더 이상 따라 움직이지 않는다
     if (!doorTouched) {   // 처음 고치는 순간 현재 기본값을 그대로 붙잡아 두고 이 칸만 바꾼다
       const n = defaultDoorNodes();
       doorNodes = n && {a: {...n.a}, b: {...n.b}};
@@ -412,11 +565,12 @@ window.zoneEditor = (() => {
     draw();
   }));
   $('#addTrafficGate').onclick = () => {
-    gates.push({gate_id:`gate-${Date.now()}-${Math.random().toString(16).slice(2)}`,wait:null,exit:null}); renderGates();
+    gates.push({gate_id:`gate-${Date.now()}-${Math.random().toString(16).slice(2)}`,wait:null,exit:null,queue:[]});
+    anchors?.gates.push(null); renderGates();
   };
   field('type').addEventListener('change',()=>{
     if (oneway()) {   // 진입 방향을 하나로 맞춘다
-      if (!gates.length) gates.push({gate_id:`gate-${Date.now()}-${Math.random().toString(16).slice(2)}`,wait:null,exit:null});
+      if (!gates.length) gates.push({gate_id:`gate-${Date.now()}-${Math.random().toString(16).slice(2)}`,wait:null,exit:null,queue:[]});
       gates.length = 1; renderGates();
     }
     sync(); draw();
@@ -460,10 +614,13 @@ window.zoneEditor = (() => {
               throw new Error('진입점 A·B 의 좌표를 모두 입력하세요.');
             data.door_nodes = [{x: v[0], y: v[1]}, {x: v[2], y: v[3]}];
           }
+          if (doorQueues.a.length || doorQueues.b.length)
+            data.door_queues = [doorQueues.a.map(q => ({x: q.x, y: q.y})), doorQueues.b.map(q => ({x: q.x, y: q.y}))];
         }
         if (data.type === 'occupancy') {
           if (!gates.length || gates.some(g => !g.wait || !g.exit)) throw new Error('방향별 대기 node와 출구 node를 선택하세요.');
-          data.gates = gates;
+          data.gates = gates.map(g => ({gate_id: g.gate_id, wait: plain(g.wait), exit: plain(g.exit),
+                                        queue: queuePoses(g.queue, g.wait)}));
         }
         url=`${mapURL()}/zones${zoneId?'/'+enc(zoneId):''}`;
         done = '구역을 저장하고 새 맵을 적용했습니다.';
@@ -487,5 +644,5 @@ window.zoneEditor = (() => {
   $('#addPickupStation').onclick=()=>{ $('#addObjectMenu').open=false; start(null, null, true); };
   $('#cancelZone').onclick=()=>{if(canLeave())run(()=>refreshSite());};
   window.addEventListener('beforeunload',e=>{if(active){e.preventDefault();e.returnValue='';}});
-  return {get active(){return active;},get editingId(){return active?zoneId:null;},cancel,canLeave,draw:drawEditor,actions,deleteStation,pointerDown,pointerMove,pointerUp,pointerCancel};
+  return {get active(){return active;},get editingId(){return active?zoneId:null;},cancel,canLeave,copy,draw:drawEditor,actions,deleteStation,pointerDown,pointerMove,pointerUp,pointerCancel};
 })();

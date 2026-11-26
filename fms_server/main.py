@@ -169,7 +169,7 @@ async def lifespan(app: FastAPI):
         log.info("FMS 서버 종료")
 
 
-app = FastAPI(title="FMS Server", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="FMS Server", version="0.2.0", lifespan=lifespan)
 # 인증은 라우터마다 건다 (FMS_AUTH=0 이면 authorize 가 바로 통과시킨다). REST·WebSocket 공통.
 _AUTH = [Depends(authorize)]
 app.include_router(robots_router, dependencies=_AUTH)

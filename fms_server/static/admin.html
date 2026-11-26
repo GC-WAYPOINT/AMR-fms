@@ -82,7 +82,7 @@
         <p id="zoneHint" role="status">맵에서 드래그해 사각형을 만드세요.</p>
         <form id="zoneForm">
           <label>구역 이름<input name="name" required maxlength="128" placeholder="구역 이름"></label>
-          <label id="zoneTypeLabel">구역 종류<select name="type"><option value="prohibit">주행금지구역 (Forbidden zone)</option><option value="elevator">엘리베이터 구역</option><option value="occupancy">점유 존 (한 대씩 통과)</option><option value="oneway">일방통행 통로 (한 방향·한 대씩)</option><option value="autodoor">자동문 (진입점 2개)</option><option value="slow">감속 구역 (속도 제한)</option></select></label>
+          <label id="zoneTypeLabel">구역 종류<select name="type"><option value="prohibit">주행금지구역 (Forbidden zone)</option><option value="elevator">엘리베이터 구역</option><option value="occupancy">점유 존 (한 대씩 통과)</option><option value="occupancy_auto">노드 없는 점유구역</option><option value="oneway">일방통행 통로 (한 방향·한 대씩)</option><option value="autodoor">자동문 (진입점 2개)</option><option value="slow">감속 구역 (속도 제한)</option></select></label>
           <div class="zone-dimensions">
             <label>기준 X (m)<input name="x" type="number" step="any" required title="회전 전 사각형의 왼쪽 위 X"></label>
             <label>기준 Y (m)<input name="y" type="number" step="any" required title="회전 전 사각형의 왼쪽 위 Y"></label>
@@ -93,7 +93,7 @@
           <label id="zoneSpeedLabel" hidden>최고 속도 (m/s)<input name="speedLimit" type="number" step="any" min="0.05" max="10" value="0.5"></label>
           <fieldset id="trafficGateFields" hidden>
             <legend>방향별 대기·출구 node</legend>
-            <p class="muted">목적지로 등록한 node를 선택하세요. 좌표를 존에 복사합니다. 대기·출구는 존 밖에 두고 서로의 통로를 막지 않도록 배치하세요.</p>
+            <p class="muted">맵에서 찍거나 목적지로 등록한 node를 고르세요. 좌표를 존에 복사합니다. 대기·출구는 존 밖에 두고 서로의 통로를 막지 않도록 배치하세요. 대기열 자리를 찍으면 앞 로봇이 존을 쓰는 동안 뒤 로봇이 도착 순서대로 섭니다. 대기 node 에서 진입 반대쪽으로 한 줄로, 로봇 길이 + 0.3 m 이상 간격으로 찍으세요.</p>
             <div id="trafficGateRows"></div>
             <button id="addTrafficGate" type="button">진입 방향 추가</button>
           </fieldset>
@@ -107,6 +107,8 @@
               <label>B X (m)<input name="doorBx" type="number" step="any"></label>
               <label>B Y (m)<input name="doorBy" type="number" step="any"></label>
             </div>
+            <p class="muted">대기열: 문을 다른 로봇이 쓰는 동안 뒤 로봇이 도착 순서대로 설 자리입니다. 진입점 바로 뒤부터 바깥쪽으로 한 줄로 찍으세요.</p>
+            <div id="doorQueueRows"></div>
           </fieldset>
           <fieldset id="pickupNodeFields" class="pickup-node" hidden>
             <legend>픽업·반납 지점 (node)</legend>

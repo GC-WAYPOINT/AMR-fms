@@ -52,6 +52,17 @@ class JobError(Exception):
     """요청이 잘못됨 (HTTP 422 급)."""
 
 
+class RouteBlocked(JobError):
+    """점유 존 경로를 만들 수 없음. robot_specific=False 면 어느 로봇을 보내도 같은 이유로 실패한다."""
+
+    def __init__(self, message, robot_specific=True):
+        super().__init__(message)
+        self.robot_specific = robot_specific
+
+
+ROUTE_RETRY_SECONDS = 30.0   # 경로를 못 만든 게시물은 맵이 바뀌지 않으면 이 시간 동안 자동 배정을 다시 시도하지 않는다
+
+
 class JobNotFound(JobError):
     """job 을 못 찾음 (HTTP 404 급)."""
 
@@ -520,6 +531,9 @@ class JobCoordinator:
     ) -> None:
         self._fleet = fleet
         self._registry = registry
+        # 경로 실패 게시물 -> (다시 시도할 시각, 그때의 맵 버전). 경로 계산은 락 안에서 수백 ms 걸려
+        # 매초 되풀이하면 MQTT State 처리(실시간 맵)가 몇 초씩 멈춘다.
+        self._route_backoff = {}
         self._store = store
         self._mqtt = mqtt
         self._elevators_src = elevators
@@ -707,7 +721,7 @@ class JobCoordinator:
             try:
                 order = self.traffic.prepare(job, order, assignment.map_id, record.state)
             except TrafficError as exc:
-                raise JobError(str(exc)) from None
+                raise RouteBlocked(str(exc), getattr(exc, "robot_specific", True)) from None
         except JobError:
             job.robot_id = previous_robot
             raise
@@ -1252,6 +1266,11 @@ class JobCoordinator:
                 site = self._registry.get_site(job.site_id)
             except Exception:
                 continue
+            versions = self._site_versions(job.site_id)
+            backoff = self._route_backoff.get(job.job_id)
+            if backoff is not None and now < backoff[0] and backoff[1] == versions:
+                continue   # 지난번 경로 실패 이유(job.error)를 그대로 둔다
+            self._route_backoff.pop(job.job_id, None)
             blocked = site.allocation_blocked
             if blocked:
                 if job.error != blocked:
@@ -1277,17 +1296,34 @@ class JobCoordinator:
                 order, why = sorted(r.robot_id for r in records), None
             if why and not order:
                 reason = why
+            dispatched = False
             for robot_id in order:
                 try:
                     self.dispatch(job.job_id, robot_id)
+                    dispatched = True
                     break
+                except RouteBlocked as exc:
+                    reason = str(exc)
+                    self._route_backoff[job.job_id] = (now + ROUTE_RETRY_SECONDS, versions)
+                    if not exc.robot_specific:
+                        break   # 다른 로봇도 같은 구간에서 실패한다
                 except JobError as exc:
                     reason = str(exc)
+            if dispatched:
+                self._route_backoff.pop(job.job_id, None)
             else:
                 self._preempt_staging(job, site)
                 if job.error != reason:
                     job.error = reason
                     self._store.save(job)
+
+    def _site_versions(self, site_id):
+        """현장 맵들의 활성 버전. 바뀌면(구역 편집 등) 경로 실패 대기를 풀고 바로 다시 시도한다."""
+        try:
+            store = self._registry.map_store(site_id)
+            return tuple(sorted((m.map_id, store.active_version(m.map_id)) for m in store.list_maps()))
+        except Exception:
+            return None
 
     def _preempt_staging(self, job: Job, site) -> None:
         """일반 작업 후보가 없고 대기 위치로 가는 중인 로봇만 있으면 그 시스템 작업을 취소한다.
@@ -1501,7 +1537,8 @@ class JobCoordinator:
         except Exception as exc:   # 존 안에서 출발하는 경우 등 — 지금은 바꾸지 않는다
             log.info("재경로 판단 보류 %s: %s", job.job_id, exc)
             return
-        current = [(c["zone"], c["gate"]) for c in job.traffic.get("crossings", []) if not c["done"]]
+        current = [(c["zone"], None if c.get("automatic") else c["gate"])
+                   for c in job.traffic.get("crossings", []) if not c["done"]]
         if gates == current:
             return   # 장애물을 피하는 다른 통로가 없다. 로봇이 스스로 기다리거나 돌아가거나 장애물이 풀리길 기다린다
         job.traffic["rerouting"] = {"at": now, "from": done, "gates": [list(g) for g in gates]}
@@ -1533,8 +1570,8 @@ class JobCoordinator:
     def _reissue(self, job: Job, rr: dict) -> None:
         saved = (job.order_id, job.done_commands, job.reroutes, job.resume_from, job.status)
         leases = self.traffic.data["leases"]
-        # 낡은 오더의 대기 node 예약은 새 오더가 다시 잡는다. 점유 존 예약은 이 지점에 오기 전에 걸러진다.
-        for key in [k for k, v in leases.items() if v["job"] == job.job_id and v["kind"] == "wait"]:
+        # 낡은 오더의 대기 node·대기열 예약은 새 오더가 다시 잡는다. 점유 존 예약은 이 지점에 오기 전에 걸러진다.
+        for key in [k for k, v in leases.items() if v["job"] == job.job_id and v["kind"] in ("wait", "queue")]:
             del leases[key]
         self.traffic.save()
         job.resume_from, job.reroutes, job.status = rr["from"], job.reroutes + 1, JobStatus.PENDING

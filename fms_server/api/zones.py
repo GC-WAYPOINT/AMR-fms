@@ -22,7 +22,7 @@ class RectangleZoneRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False, str_strip_whitespace=True)
     base_version: str = Field(min_length=1)
     name: str = Field(min_length=1, max_length=128)
-    type: Literal['prohibit', 'elevator', 'occupancy', 'slow', 'autodoor']
+    type: Literal['prohibit', 'elevator', 'occupancy', 'occupancy_auto', 'slow', 'autodoor']
     speed_limit: float | None = Field(default=None, gt=0, le=10)   # 감속 구역(slow)의 최고 속도 m/s
     gates: list[TrafficGate] = Field(default_factory=list, max_length=16)
     x: float
@@ -33,6 +33,7 @@ class RectangleZoneRequest(BaseModel):
     # 자동문(type=autodoor) 전용. 점유 존 + door 로 저장한다 (로봇은 일반 점유 존으로 본다).
     door_id: str | None = Field(default=None, pattern=r'^[A-Za-z0-9_-]+$', max_length=64)  # 없으면 zone_id
     door_nodes: list[Point] | None = Field(default=None, min_length=2, max_length=2)       # [A, B]. 없으면 문 양쪽 기본 위치
+    door_queues: list[list[Point]] | None = Field(default=None, min_length=2, max_length=2)  # [A 쪽, B 쪽] 대기열
 
     @model_validator(mode='after')
     def validate_zone(self):
@@ -45,15 +46,22 @@ class RectangleZoneRequest(BaseModel):
             if self.gates:
                 raise ValueError('자동문의 진입점은 door_nodes 로 지정한다')
             a, b = self.door_nodes or default_door_nodes(polygon)
+            qa, qb = self.door_queues or ([], [])
             return Zone(zone_id=zone_id, name=self.name, type=ZoneType.OCCUPANCY, polygon=polygon,
-                        door=AutoDoor(door_id=self.door_id or zone_id, node_a=a, node_b=b))
-        if self.door_id or self.door_nodes:
-            raise ValueError('door_id·door_nodes 는 자동문(autodoor)에만 지정할 수 있다')
-        return Zone(zone_id=zone_id, name=self.name, type=self.type, gates=self.gates, speed_limit=self.speed_limit,
+                        door=AutoDoor(door_id=self.door_id or zone_id, node_a=a, node_b=b, queue_a=qa, queue_b=qb))
+        if self.door_id or self.door_nodes or self.door_queues:
+            raise ValueError('door_id·door_nodes·door_queues 는 자동문(autodoor)에만 지정할 수 있다')
+        if self.type == 'occupancy' and not self.gates:
+            raise ValueError('점유 존에는 대기·출구 node 쌍이 필요합니다.')
+        if self.type == 'occupancy_auto' and self.gates:
+            raise ValueError('노드 없는 점유구역에는 대기·출구 node를 지정할 수 없습니다.')
+        zone_type = ZoneType.OCCUPANCY if self.type == 'occupancy_auto' else self.type
+        return Zone(zone_id=zone_id, name=self.name, type=zone_type, gates=self.gates, speed_limit=self.speed_limit,
                     polygon=polygon)
 
 
 DOOR_NODE_OFFSET = 0.8  # 자동문 기본 진입점이 문 구역 경계에서 떨어지는 거리 (m)
+QUEUE_MIN_GAP = 0.8     # 대기열 자리 사이 최소 간격 (m). 실제로는 로봇 길이 + 여유 이상 띄운다
 
 
 def default_door_nodes(polygon) -> tuple[Point, Point]:
@@ -107,6 +115,11 @@ def _edit_locked(request, site_id, map_id, version, zone_id, zone=None, *, creat
                         raise HTTPException(422, '대기·출구 node는 존 바깥의 FREE 위치에 지정하세요.')
                     if gate.wait == gate.exit:
                         raise HTTPException(422, '대기 node와 출구 node는 달라야 합니다.')
+                    if any(not model.is_free(p.x,p.y) or intersects(bounds(zone),p,0.1) for p in gate.queue):
+                        raise HTTPException(422, '대기열 node는 존 바깥의 FREE 위치에 지정하세요.')
+                    line = [gate.wait, *gate.queue]
+                    if any(math.hypot(a.x-b.x, a.y-b.y) < QUEUE_MIN_GAP for a, b in zip(line, line[1:])):
+                        raise HTTPException(422, f'대기열 자리는 앞 자리와 {QUEUE_MIN_GAP} m 이상 떨어뜨리세요.')
         if not create:
             existing = store.load_annotations(map_id).zone_by_id(zone_id)
             if existing is not None and existing.type == ZoneType.PICKUP:

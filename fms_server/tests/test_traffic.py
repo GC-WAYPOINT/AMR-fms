@@ -4,7 +4,7 @@ import json
 import time
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 from fastapi.testclient import TestClient
 
 from common.schemas import BusySubState, LocalizationState, Order, Pose, RobotState
@@ -86,6 +86,25 @@ def dispatch(e,rid,target):
 
 def latest(job):
     return Order.model_validate(job.order_snapshot)
+
+
+def automatic_body(version, **changes):
+    return {**zone_body(version), "type": "occupancy_auto", "gates": [], **changes}
+
+
+def add_automatic_zone(e, **changes):
+    result = e["client"].post(BASE + "/zones", json=automatic_body(e["version"], **changes))
+    assert result.status_code == 200, result.text
+    for rid in ("R1", "R2", "R3"):
+        p = e["fleet"].get(rid).state.pose
+        e["report"](rid, p.x, p.y)
+    return result.json()
+
+
+def arrive(e, job, node):
+    order = latest(job)
+    p = order.nodes[node].position
+    e["report"](job.robot_id, p.x, p.y, order, node=node)
 
 
 def leases(e,kind):
@@ -253,11 +272,250 @@ def test_rotated_zones_use_actual_boundary_for_overlap_mask_and_legacy_leases(en
     assert intersects((7,0,9,10),Pose(**pose(8,5)),.5)  # 이전 예약 포맷
     assert not intersects((7,0,9,10),Pose(**pose(10,5)),.5)
     planner = ZonePlanner(store.load_map_model('f1'),[z],env['fleet'].get('R1').state)
+    cells = planner._zone_cells(z, planner.margin)
     x,y = planner.model.world_to_pixel(6,3)
-    assert planner.mask(None)[y,x]
+    assert not cells[y,x]
     x,y = planner.model.world_to_pixel(8,5)
-    assert not planner.mask(None)[y,x]
+    assert cells[y,x]
     second = client.post(BASE+'/zones',json=rotated(first.json()['version'],9.4,6.4))
     assert second.status_code == 200,second.text  # 외접 사각형은 겹쳐도 실제 존은 분리됨
     overlap = client.post(BASE+'/zones',json=rotated(second.json()['version'],8.1,5.1))
     assert overlap.status_code == 422
+
+
+def test_automatic_zone_editor_contract(env):
+    client = env["client"]
+    wrong = automatic_body(env["version"], gates=zone_body(env["version"])["gates"])
+    assert client.post(BASE + "/zones", json=wrong).status_code == 422
+    result = add_automatic_zone(env, x=7, y=2, height=5, rotation=15)
+    url = BASE + "/zones/" + result["zone_id"]
+    ann = env["registry"].map_store("hq").load_annotations("f1")
+    z = ann.zone_by_id(result["zone_id"])
+    assert z.automatic_gate and z.type.value == "occupancy" and z.gates == []
+    assert client.post(BASE + "/zones", json=automatic_body(result["version"], x=7, y=2, height=5)).status_code == 422
+    edited = client.put(url, json=automatic_body(result["version"], x=7, y=3, height=4, rotation=-20))
+    assert edited.status_code == 200, edited.text
+    assert client.delete(url, params={"base_version": edited.json()["version"]}).status_code == 200
+
+
+def test_automatic_zone_reserves_before_entry_and_waits_until_entire_body_exits(env):
+    z = add_automatic_zone(env)
+    a, oa = dispatch(env, "R1", "east")
+    b, ob = dispatch(env, "R2", "west")
+    assert [n.released for n in oa.nodes] == [True, False, False]
+    assert [n.released for n in ob.nodes] == [True, False, False]
+    assert 6 < oa.nodes[0].position.x < 7
+    arrive(env, a, 0)
+    arrive(env, b, 0)
+    assert latest(a).nodes[1].allowed_zone_ids == [z["zone_id"]]
+    assert not latest(b).nodes[1].released
+    assert leases(env, "zone")[0]["robot"] == "R1"
+    env["report"]("R1", 9.2, 3, latest(a), node=1)
+    assert not latest(b).nodes[1].released
+    arrive(env, a, 1)
+    assert latest(b).nodes[1].released and latest(a).nodes[2].released
+    assert a.done_commands == 0
+    assert leases(env, "zone")[0]["robot"] == "R2"
+
+
+def test_automatic_zone_stays_occupied_across_internal_actions_and_jobs(env):
+    z = add_automatic_zone(env)
+    registry = env["registry"]
+    registry.location_store("hq").create("inside", "f1", 8, 3, 0)
+    job = env["jobs"].create("hq", [
+        dict(type="move", target="inside"), dict(type="wait", target="inside", duration=2)], "R1")
+    env["coord"].dispatch(job.job_id)
+    assert [n.released for n in latest(job).nodes] == [True, False, False]
+    arrive(env, job, 0)
+    assert all(n.released for n in latest(job).nodes)
+    assert all(n.allowed_zone_ids == [z["zone_id"]] for n in latest(job).nodes[1:])
+    assert len(job.traffic["crossings"]) == 1 and job.traffic["crossings"][0]["exit"] is None
+    arrive(env, job, 1)
+    env["report"]("R1", 8, 3)
+    assert job.status.value == "success"
+    assert leases(env, "zone")[0]["job"] == job.job_id
+    assert env["client"].get(BASE + "/traffic").json()["zones"][0]["status"] == "occupied"
+    b, ob = dispatch(env, "R2", "west")
+    assert ob.nodes[0].released
+    arrive(env, b, 0)
+    assert not latest(b).nodes[1].released
+    leaving, order = dispatch(env, "R1", "east")
+    assert order.nodes[0].released and order.nodes[0].allowed_zone_ids == [z["zone_id"]]
+    assert leases(env, "zone")[0]["job"] == leaving.job_id
+    arrive(env, leaving, 0)
+    assert latest(b).nodes[1].released
+
+
+def test_automatic_zone_unknown_peer_and_restart_before_entry(env):
+    add_automatic_zone(env)
+    a, _ = dispatch(env, "R1", "east")
+    b, _ = dispatch(env, "R2", "west")
+    arrive(env, a, 0)
+    arrive(env, b, 0)
+    env["coord"].stop()
+    jobs = JobStore(env["tmp"])
+    restored = JobCoordinator(env["fleet"], env["registry"], jobs, env["mqtt"])
+    env["coord"] = restored
+    restored.start()
+    env["fleet"].forget("R1")
+    restored.tick_traffic()
+    b = jobs.get(b.job_id)
+    assert not latest(b).nodes[1].released
+    assert leases(env, "zone")[0]["robot"] == "R1"
+    a = jobs.get(a.job_id)
+    p = latest(a).nodes[1].position
+    env["report"]("R1", p.x, p.y, latest(a), node=1, localization=LocalizationState.UNLOCALIZED)
+    assert not latest(b).nodes[1].released
+    arrive(env, a, 1)
+    assert latest(b).nodes[1].released
+
+
+def test_automatic_zone_detects_robot_parked_inside_before_any_order(env):
+    add_automatic_zone(env)
+    env["report"]("R1", 8, 3)
+    state = env["client"].get(BASE + "/traffic").json()["zones"][0]
+    assert state["status"] == "occupied" and state["owner"] == "R1"
+    b, _ = dispatch(env, "R2", "west")
+    arrive(env, b, 0)
+    assert not latest(b).nodes[1].released
+    env["report"]("R1", 11, 3)
+    assert latest(b).nodes[1].released
+
+
+def test_automatic_zone_accepts_exact_start_outside_when_cell_center_is_inside(env):
+    from fms_server.traffic import STOP_CLEARANCE, radius
+
+    left = 6.45 + radius(env["fleet"].get("R1").state) + STOP_CLEARANCE
+    add_automatic_zone(env, x=left)
+    env["report"]("R1", 6.42, 3)
+    job, order = dispatch(env, "R1", "east")
+    assert job.traffic["crossings"][0]["wait"] is None
+    assert order.nodes[0].released and order.nodes[0].allowed_zone_ids
+
+
+def test_automatic_wait_stays_back_if_it_would_block_a_narrow_exit(env):
+    image = Image.new("L", (80, 50), 0)
+    ImageDraw.Draw(image).rectangle((0, 22, 79, 27), fill=255)
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    store = env["registry"].map_store("hq")
+    result = store.ingest_upload("f1", {
+        "fms_map.json": json.dumps(dict(name="corridor", image="grid.png", resolution=.2,
+                                        origin_x=0, origin_y=0, width_px=80, height_px=50)).encode(),
+        "grid.png": buf.getvalue(),
+    }, activate=True)
+    env["version"] = result.version
+    env["report"]("R1", 8, 5)
+    env["report"]("R2", 13, 5)
+    env["report"]("R3", 3, 5)
+    add_automatic_zone(env)
+    locations = env["registry"].location_store("hq")
+    locations.create("corridor-east", "f1", 11.6, 5, 0)
+    locations.create("corridor-west", "f1", 4.5, 5, 0)
+    waiting, ob = dispatch(env, "R2", "corridor-west")
+    assert not any(n.released for n in ob.nodes)
+    assert waiting.traffic["waiting"] == "대기 node 주변 확인 대기"
+    leaving, oa = dispatch(env, "R1", "corridor-east")
+    assert oa.nodes[0].released
+    arrive(env, leaving, 0)
+    env["report"]("R1", 11.6, 5, latest(leaving), node=1)
+    assert latest(waiting).nodes[0].released
+
+
+def test_automatic_zone_canceled_inside_can_exit_on_a_new_order(env):
+    add_automatic_zone(env)
+    a, _ = dispatch(env, "R1", "east")
+    b, _ = dispatch(env, "R2", "west")
+    arrive(env, a, 0)
+    arrive(env, b, 0)
+    env["report"]("R1", 8, 3, latest(a), node=0)
+    env["coord"].cancel(a.job_id)
+    env["report"]("R1", 8, 3)
+    assert a.status.value == "canceled" and not latest(b).nodes[1].released
+    leaving, order = dispatch(env, "R1", "east")
+    assert order.nodes[0].released
+    arrive(env, leaving, 0)
+    assert latest(b).nodes[1].released
+
+
+def test_automatic_zone_waiter_yields_floor_capacity_for_the_resident_exit(env):
+    add_automatic_zone(env)
+    assert env["client"].put(BASE + "/traffic", json={"max_moving_robots": 1}).status_code == 200
+    env["registry"].location_store("hq").create("inside", "f1", 8, 3, 0)
+    entering, _ = dispatch(env, "R1", "inside")
+    arrive(env, entering, 0)
+    arrive(env, entering, 1)
+    waiting, ob = dispatch(env, "R2", "west")
+    assert not any(n.released for n in ob.nodes)
+    env["report"]("R2", 13, 7, ob)
+    env["report"]("R1", 8, 3)
+    assert latest(waiting).nodes[0].released and leases(env, "floor")[0]["robot"] == "R2"
+    arrive(env, waiting, 0)
+    assert not latest(waiting).nodes[1].released
+    assert not leases(env, "floor")
+    leaving, oa = dispatch(env, "R1", "east")
+    assert oa.nodes[0].released
+    arrive(env, leaving, 0)
+    assert not latest(waiting).nodes[1].released  # R1은 출구 뒤 목적지까지 이동 중이다.
+    env["report"]("R1", 13, 3)
+    assert latest(waiting).nodes[1].released
+
+
+def test_automatic_and_explicit_gates_in_same_route(env):
+    auto = add_automatic_zone(env, x=5, width=1)
+    body = zone_body(auto["version"])
+    body.update(x=9, width=1, gates=[dict(gate_id="east", wait=pose(8, 3), exit=pose(11, 3))])
+    gated = env["client"].post(BASE + "/zones", json=body)
+    assert gated.status_code == 200, gated.text
+    for rid in ("R1", "R2", "R3"):
+        p = env["fleet"].get(rid).state.pose
+        env["report"](rid, p.x, p.y)
+    job, _ = dispatch(env, "R1", "east")
+    assert [(c["zone"], c.get("automatic")) for c in job.traffic["crossings"]] == [
+        (auto["zone_id"], True), (gated.json()["zone_id"], None)]
+    for node in (0, 1, 2, 3):
+        assert latest(job).nodes[node].released
+        arrive(env, job, node)
+    assert latest(job).nodes[-1].released
+
+
+def test_gate_zone_allows_destination_and_start_inside(env):
+    """gate 존 안의 목적지(예: 통로 안 상차지점)는 그 경로에서 노드 없는 존처럼 허가한다."""
+    z = add_zone(env)
+    env["registry"].location_store("hq").create("inside", "f1", 8, 3, 0)
+    job = env["jobs"].create("hq", [
+        dict(type="pickup", target="inside", duration=2), dict(type="move", target="east")], "R1")
+    env["coord"].dispatch(job.job_id)
+    crossings = job.traffic["crossings"]
+    assert len(crossings) == 1 and crossings[0]["automatic"] and crossings[0]["zone"] == z["zone_id"]
+    order = latest(job)
+    wait = crossings[0]["wait"]
+    assert wait is not None and order.nodes[wait].position.x < 7     # 존 앞 경로 점에서 허가를 받는다
+    assert crossings[0]["exit"] is not None and order.nodes[crossings[0]["exit"]].position.x > 9
+    arrive(env, job, wait)
+    assert leases(env, "zone")[0]["robot"] == "R1"
+    # 다른 로봇은 같은 존을 지나지 못한다.
+    b, ob = dispatch(env, "R2", "west")
+    arrive(env, b, 0)
+    assert not latest(b).nodes[1].released
+    # 존 안에서 출발하는 경로도 거절하지 않는다.
+    planner = env["coord"].traffic._planner(env["registry"].map_store("hq"), "hq", "f1", env["version"],
+                                            env["registry"].map_store("hq").load_annotations("f1").zones,
+                                            env["fleet"].get("R1").state)
+    route = planner.route(Pose(x=8, y=3, theta=0), Pose(x=13, y=3, theta=0))
+    assert len(route) == 1 and route[0][1].wait is None and route[0][1].exit is not None
+
+
+def test_straight_route_through_two_automatic_zones_waits_between_them(env):
+    """두 노드 없는 존을 직선으로 연달아 지나면 사이 구간 가운데에서 퇴장·대기한다 (꼭짓점이 없어도)."""
+    from common.map_annotations import Zone, ZoneType, rectangle_polygon
+    from fms_server.traffic import ZonePlanner
+    zones = [Zone(zone_id=f"z{i}", name=f"z{i}", type=ZoneType.OCCUPANCY, polygon=rectangle_polygon(x, 0, 1, 10))
+             for i, x in enumerate((5, 8))]
+    store = env["registry"].map_store("hq")
+    planner = ZonePlanner(store.load_map_model("f1"), zones, env["fleet"].get("R1").state)
+    route = planner.route(Pose(x=3, y=3, theta=0), Pose(x=13, y=3, theta=0))
+    assert [z.zone_id for z, _ in route] == ["z0", "z1"]
+    first, second = route[0][1], route[1][1]
+    assert 6 < first.exit.x < 8 and 6 < second.wait.x < 8   # 두 존 사이에서 서고 다시 허가를 받는다
+    assert first.wait.x < 5 and second.exit.x > 9

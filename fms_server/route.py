@@ -69,6 +69,11 @@ def _node(pose, cmd=None, action=None) -> dict:
 
 
 _COARSE = 0.25  # 주행 거리 계산 격자 (m)
+# 같은 맵 객체에 대한 거친 격자와 거리 결과 캐시. 배정 순위는 매초 다시 계산되는데(락 안), 대기 로봇과
+# 목적지는 대개 그대로라 같은 탐색을 되풀이하면 MQTT State 처리가 밀린다. 맵 객체가 바뀌면(새 버전) 새로 만든다.
+_BLOCKS: dict[int, tuple] = {}
+_DISTANCES: dict[tuple, list] = {}
+_DISTANCE_CACHE_MAX = 512
 
 
 def path_distances(model, start_xy, goals) -> list[float]:
@@ -80,13 +85,22 @@ def path_distances(model, start_xy, goals) -> list[float]:
 
     import numpy as np
 
+    import weakref
+
     m = model.metadata
     k = max(1, round(_COARSE / m.resolution))
-    free = model.classify_grid() == 2
-    h, w = (free.shape[0] // k) * k, (free.shape[1] // k) * k
-    # 1 px 벽선도 막아야 하므로 "대부분 FREE" 가 아니라 막힌 픽셀 수로 본다 (고립 노이즈 1~2 px 는 봐준다)
-    blocked_px = (~free[:h, :w]).reshape(h // k, k, w // k, k).sum(axis=(1, 3))
-    blocks = blocked_px < max(2, k // 2)
+    cached = _BLOCKS.get(id(model))
+    if cached is not None and cached[0]() is model:
+        blocks = cached[1]
+    else:
+        free = model.classify_grid() == 2
+        h, w = (free.shape[0] // k) * k, (free.shape[1] // k) * k
+        # 1 px 벽선도 막아야 하므로 "대부분 FREE" 가 아니라 막힌 픽셀 수로 본다 (고립 노이즈 1~2 px 는 봐준다)
+        blocked_px = (~free[:h, :w]).reshape(h // k, k, w // k, k).sum(axis=(1, 3))
+        blocks = blocked_px < max(2, k // 2)
+        for key in [key for key, (ref, _) in _BLOCKS.items() if ref() is None]:
+            del _BLOCKS[key]
+        _BLOCKS[id(model)] = (weakref.ref(model), blocks)
     rows, cols = blocks.shape
     cell = k * m.resolution
 
@@ -108,6 +122,10 @@ def path_distances(model, start_xy, goals) -> list[float]:
     out = [math.inf] * len(goals)
     if src is None:
         return out
+    memo = (id(model), src, tuple(targets))
+    hit = _DISTANCES.get(memo)
+    if hit is not None and hit[0]() is model:
+        return list(hit[1])
     want = {t: [] for t in targets if t is not None}
     for i, t in enumerate(targets):
         if t is not None:
@@ -133,6 +151,9 @@ def path_distances(model, start_xy, goals) -> list[float]:
                 if nd < dist[rr, cc]:
                     dist[rr, cc] = nd
                     heapq.heappush(heap, (nd, (rr, cc)))
+    if len(_DISTANCES) >= _DISTANCE_CACHE_MAX:
+        _DISTANCES.clear()
+    _DISTANCES[memo] = (weakref.ref(model), list(out))
     return out
 
 
