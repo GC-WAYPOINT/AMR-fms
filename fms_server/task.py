@@ -1431,6 +1431,7 @@ class JobCoordinator:
         if not getattr(self._mqtt, "connected", True):
             return
         from fms_server.config import settings
+        from fms_server.traffic import radius as traffic_radius
         traffic = self.traffic
         for job in self._store.list():
             if job.status != JobStatus.WORKING or job.plan or not job.robot_id or not job.traffic:
@@ -1455,15 +1456,35 @@ class JobCoordinator:
                 continue   # 존 안에 있거나 진입 허가를 받았다. 퇴장 증거 없이 오더를 바꾸지 않는다
             if not traffic.obstacles.rects(job.site_id, job.traffic.get("map_id")):
                 continue   # 등록된 장애물이 없으면 판단할 것이 없다 (등록되면 바로 판단하도록 쿨다운도 쓰지 않는다)
+            # 그 장애물이 실제로 이 로봇의 길을 막고 있을 때만 (로봇끼리 막힘·허가 후 정지·다른 곳의 장애물 제외).
+            blocking = traffic.obstacles.blocking(job.site_id, job.traffic.get("map_id"), s, traffic_radius(s),
+                                                  self._paths_ahead(job, s))
+            if not blocking:
+                continue
             if now - traffic.reroute_tried.get(job.job_id, 0) < 60.0:
                 continue
             traffic.reroute_tried[job.job_id] = now
             try:
-                self._try_reroute(job, s, now)
+                self._try_reroute(job, s, now, blocking)
             except Exception:
                 log.exception("재경로 판단 실패 %s", job.job_id)
 
-    def _try_reroute(self, job: Job, state: State, now: float) -> None:
+    @staticmethod
+    def _paths_ahead(job: Job, state: State) -> list[list[tuple[float, float]]]:
+        """로봇 앞 경로 후보: 로봇이 보고한 남은 경유점(local_path), 아직 도달하지 않은 오더 노드 순서."""
+        start = (state.pose.x, state.pose.y)
+        paths = []
+        if state.local_path:
+            paths.append([start] + [(p.x, p.y) for p in state.local_path])
+        positions = {n["node_id"]: (n["position"]["x"], n["position"]["y"])
+                     for n in (job.order_snapshot or {}).get("nodes", []) if n.get("position")}
+        ahead = [positions[n.node_id] for n in sorted(state.node_states, key=lambda n: n.sequence_id)
+                 if n.node_id in positions]
+        if ahead:
+            paths.append([start] + ahead)
+        return paths
+
+    def _try_reroute(self, job: Job, state: State, now: float, blocking=()) -> None:
         assignment = self._registry.assignment_for(job.robot_id)
         if assignment is None:
             return
@@ -1490,7 +1511,8 @@ class JobCoordinator:
         self._event("traffic.reroute", job, "warning",
                     reason="맵 전역 장애물에 막힘 — 다른 통로로 오더를 다시 만든다",
                     from_gates=[list(g) for g in current], to_gates=[list(g) for g in gates],
-                    obstacles=len(self.traffic.obstacles.rects(job.site_id, assignment.map_id)))
+                    obstacles=len(self.traffic.obstacles.rects(job.site_id, assignment.map_id)),
+                    blocking=[list(b) for b in blocking])
 
     def _continue_reroute(self, job: Job, state: State) -> None:
         """취소가 확인되면 같은 작업을 새 order_id 로 다시 보낸다. 취소가 안 먹으면 포기하고 원래 오더를 이어 간다."""

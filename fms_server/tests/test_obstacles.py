@@ -118,6 +118,8 @@ def test_blocked_robot_is_rerouted_through_other_gate(env):
     for dt in (0, 30.1):                           # 아래 통로 대기 node(5,3) 를 막는다
         see(env, 'R3', 3, 1, seen(5, 3, 0.4))
         reg.update(t0 + dt)
+    # R1 도 앞의 장애물을 보고 있다 (재경로 조건: 자기 센서로 보는 등록 장애물이 남은 경로를 막음)
+    env['report']('R1', 3, 3, first, node_states=remaining(first), detected_obstacles=[seen(5, 3, 0.4)])
     traffic.analyze(t0)
     env['coord'].tick_reroute(t0 + 5)
     assert 'rerouting' not in job.traffic          # 15 초 전에는 기다린다
@@ -178,3 +180,56 @@ def test_stale_last_node_from_previous_order_is_not_progress(env):
                   node_states=remaining(order))
     assert env['jobs'].get(job.job_id).status.value == 'working'
     assert job.done_commands == 0
+
+
+def assert_route_would_change(e, job):
+    """예전 조건(등록 장애물 + 경로 선택이 바뀜)이었다면 재경로했을 상황인지 확인한다."""
+    from common.schemas import Pose
+    gates = e['coord'].traffic.preview_gates(job, 'f1', e['fleet'].get('R1').state, [Pose(x=13, y=3, theta=0)],
+                                             with_obstacles=True)
+    assert [g for _, g in gates] == ['upper']
+
+
+def register(e, *obstacles):
+    """R3 이 30 초 넘게 보고해 장애물을 등록한다."""
+    reg, t0 = registry_of(e), time.time()
+    for dt in (0, 30.1):
+        see(e, 'R3', 3, 1, *obstacles)
+        reg.update(t0 + dt)
+    return t0
+
+
+def test_robot_not_seeing_registered_obstacle_is_not_rerouted(env):
+    """로봇끼리 막힘·허가를 받고도 선 로봇(이상 주입 stop_after_release): 자기 앞 장애물을 보지 않는다."""
+    job, first = blocked_at_lower_wait(env)
+    t0 = register(env, seen(5, 3, 0.4))            # 다른 로봇이 등록한 장애물이 아래 통로에 있다
+    traffic = env['coord'].traffic
+    assert_route_would_change(env, job)
+    traffic.analyze(t0)
+    env['coord'].tick_reroute(t0 + 20)
+    assert 'rerouting' not in job.traffic and job.reroutes == 0
+
+
+def test_seen_obstacle_off_path_does_not_trigger_reroute(env):
+    """경로 선택을 바꾸는 장애물이 있어도, 로봇이 보는 장애물이 자기 길 밖이면 재경로하지 않는다."""
+    job, first = blocked_at_lower_wait(env)
+    t0 = register(env, seen(5, 3, 0.4), seen(3, 5, 0.4))
+    # R1 은 옆(3,5)의 장애물만 본다. 길(y=3)에서 1.8 m 떨어져 차체에 닿지 않는다.
+    env['report']('R1', 3, 3, first, node_states=remaining(first), detected_obstacles=[seen(3, 5, 0.4)])
+    traffic = env['coord'].traffic
+    assert_route_would_change(env, job)
+    traffic.analyze(t0)
+    env['coord'].tick_reroute(t0 + 20)
+    assert 'rerouting' not in job.traffic and job.reroutes == 0
+
+
+def test_seen_obstacle_beyond_reach_does_not_trigger_reroute(env):
+    """길 위에 있어도 로봇 앞 3 m 밖이면 이 로봇이 그것 때문에 선 것이 아니다."""
+    job, first = blocked_at_lower_wait(env)
+    t0 = register(env, seen(5, 3, 0.4))
+    # R1 이 대기 node 5 m 앞(0,3)에 서 있다 — 경로 위 장애물이지만 3 m 밖
+    env['report']('R1', 0, 3, first, node_states=remaining(first), detected_obstacles=[seen(5, 3, 0.4)])
+    traffic = env['coord'].traffic
+    traffic.analyze(t0)
+    env['coord'].tick_reroute(t0 + 20)
+    assert 'rerouting' not in job.traffic and job.reroutes == 0

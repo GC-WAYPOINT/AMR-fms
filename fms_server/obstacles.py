@@ -20,10 +20,39 @@ import time
 
 CELL = 0.02         # 확인 중인 후보를 묶는 격자 크기 (m). 장애물 한 줄(칸 하나 ≈ 0.09 m)이 하나로 뭉치지 않게 작게 둔다
 SAME_SPOT = 0.04    # 보고된 장애물이 등록된 것과 같은 자리라고 보는 거리 (m)
+SEEN_MATCH = 0.3    # 재경로 판단: 로봇이 지금 보고하는 장애물이 등록 항목과 같은 것이라고 보는 중심 거리 (m)
+BLOCK_REACH = 3.0   # 재경로 판단: 로봇 앞 경로 이 길이(m) 안에 있어야 "길을 막고 있다"고 본다
+PATH_STEP = 0.1     # 경로를 따라 장애물과의 거리를 재는 간격 (m)
 
 
 def _cell(x, y):
     return round(x / CELL), round(y / CELL)
+
+
+def _rect_distance(px, py, e):
+    dx = max(abs(px - e["x"]) - e["width"] / 2, 0.0)
+    dy = max(abs(py - e["y"]) - e["height"] / 2, 0.0)
+    return math.hypot(dx, dy)
+
+
+def _path_hits(points, e, radius, reach):
+    """points 를 따라 처음 reach m 안에서 차체(반경 radius)가 사각형 e 에 닿는가."""
+    if not points:
+        return False
+    if _rect_distance(points[0][0], points[0][1], e) <= radius:
+        return True
+    travelled = 0.0
+    for (ax, ay), (bx, by) in zip(points, points[1:]):
+        length = math.hypot(bx - ax, by - ay)
+        steps = max(1, int(length / PATH_STEP))
+        for i in range(1, steps + 1):
+            if travelled + length * i / steps > reach:
+                return False
+            px, py = ax + (bx - ax) * i / steps, ay + (by - ay) * i / steps
+            if _rect_distance(px, py, e) <= radius:
+                return True
+        travelled += length
+    return False
 
 
 class ObstacleRegistry:
@@ -41,6 +70,17 @@ class ObstacleRegistry:
         """경로 계획에 넘길 [(x, y, width, height)]."""
         return [(e["x"], e["y"], e["width"], e["height"])
                 for e in self._entries.get(f"{site}/{map_id}", {}).values()]
+
+    def blocking(self, site, map_id, state, radius, paths, reach=BLOCK_REACH):
+        """재경로 판단용: 등록 장애물 중 (1) 이 로봇이 지금 센서로 보고 있고 (2) 남은 경로 앞 reach m 안에서
+        차체에 닿는 것. 로봇끼리 막힘(몸체는 등록하지 않음)이나 허가를 받고도 선 로봇(장애물을 안 봄)은 빈 목록이다."""
+        out = []
+        for e in self._entries.get(f"{site}/{map_id}", {}).values():
+            if not any(math.hypot(o.x - e["x"], o.y - e["y"]) <= SEEN_MATCH for o in state.detected_obstacles):
+                continue
+            if any(_path_hits(path, e, radius, reach) for path in paths):
+                out.append((e["x"], e["y"], e["width"], e["height"]))
+        return out
 
     def snapshot(self, site, map_id, now=None):
         now = time.time() if now is None else now
