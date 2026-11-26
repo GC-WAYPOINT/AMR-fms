@@ -88,6 +88,23 @@
 | `charge.`, `staging.` | 자동 충전·대기 복귀 |
 | `alert.`, `webhook.`, `auth.` | 알림·연동 |
 
+### 존 대기와 배정 스냅샷 (분석·학습용 필드)
+
+점유 존 대기 시간을 이벤트만으로 다시 계산할 수 있게 남긴다. 설계서 3장(혼잡 예측 특징·라벨)이 이 필드를 쓴다.
+
+| 이벤트 | 필드 | 뜻 |
+|---|---|---|
+| `traffic.wait` / `traffic.wait_end` | `reason`, `zone_id`, `gate_id`, `phase`, (끝) `seconds`, `outcome` | 대기 구간 하나. 이유·존·gate·단계 중 하나라도 바뀌면 구간을 끊고 새로 연다. `outcome`: `next`(다른 대기로 넘어감) / `clear`(허가) / `reorder`(오더 재구성) / `stage`(다층 단계 전환) / `success`·`failed`·`canceled`(작업 종료) |
+| | `phase` | `approach` 대기 node 로 주행 중(서 있지 않음) · `at_wait` 대기 node 에 정지 · `before_wait` 대기 node 앞에서 멈춤 · `floor` 층 정원 · `map` 맵·위치 확인 |
+| `traffic.at_wait` | `zone_id`, `gate_id`, `approach_s`, `zone_busy` | 그 통과에서 대기 node 에 처음 멈춘 순간. `approach_s` = 대기 node 예약부터 도착까지 |
+| `traffic.reserve` (존) | `zone_id`, `gate_id`, `queued_s` | 진입 허가. **`queued_s` = 대기 node 도착 -> 허가 = 존 대기 시간** |
+| `traffic.release` | `held_s` | 예약을 잡고 있던 시간. 존이면 진입 허가 -> 출구 통과(존 통과 시간) |
+| `job.assigned` | `snapshot`, `reroutes` | 배정 순간 FMS 가 알던 값: `soc`, `x`, `y`, `moving_robots`, `floor_cap`, `jobs_posted_3m`, `pending`, `robots`, 지날 존마다 `zones[]` = `queue_len`(대기 node 에 선 다른 로봇, 양방향 합) · `queue_len_dir`(같은 gate) · `before_wait` · `reserved_ahead`(이 존을 앞으로 지날 다른 작업) · `occupied` · `occ_elapsed_s` · `entries_1m/3m` · `avg_pass_s`(최근 10회) · `passes_n`. 이 작업 자신은 빼고, 이 작업이 예약을 잡기 전에 잰다 |
+
+- 통계의 교통 대기 평균은 `approach` 구간을 뺀 `traffic.wait_end` 로 계산한다.
+- `entries_*`·`avg_pass_s` 의 이력은 메모리에만 있다. 서버를 다시 띄우면 0 부터 다시 센다.
+- 2026-11-26 이전 기록은 `traffic.wait_end.seconds` 에 대기 node 까지 주행 시간이 섞여 있고 첫 대기가 빠져 있다. 학습에 쓰지 않는다.
+
 ## 알림
 
 **알림** 화면 또는 `GET /api/v1/alerts?site=&open=`, `POST /api/v1/alerts/{id}/ack`. 같은 대상의 알림은 열린 것이 하나뿐이다.

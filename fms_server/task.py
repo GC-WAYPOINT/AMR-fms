@@ -551,6 +551,19 @@ class JobCoordinator:
                 data.setdefault("system", job.system)       # KPI 는 시스템 작업을 따로 센다
         self._events.record(kind, severity=severity, **data)
 
+    def _assign_snapshot(self, job: Job, state: State) -> dict:
+        """배정 순간 FMS 가 알던 값 (AI 학습 특징 원본·누출 검사용). 교통 상태 + 최근 3분 게시 수·등록 대수."""
+        now = time.time()
+        snap = self.traffic.assign_snapshot(job, state, now)
+        site_jobs = self._store.list(job.site_id)
+        snap["jobs_posted_3m"] = sum(1 for j in site_jobs if (_epoch(j.created_at) or 0) >= now - 180)
+        snap["pending"] = sum(1 for j in site_jobs if j.status == JobStatus.PENDING and j.job_id != job.job_id)
+        try:
+            snap["robots"] = len(self._registry.get_site(job.site_id).robots)
+        except Exception:
+            snap["robots"] = None
+        return snap
+
     @staticmethod
     def _since(iso: Optional[str]) -> Optional[float]:
         start = _epoch(iso) if iso else None
@@ -699,6 +712,7 @@ class JobCoordinator:
             job.robot_id = previous_robot
             raise
         job.order_snapshot = order.model_dump(mode="json")
+        snapshot = self._assign_snapshot(job, record.state)   # 이 작업이 예약을 잡기 전 상태
         update = self.traffic.update(job)
         if update is not None:
             order = update
@@ -715,7 +729,8 @@ class JobCoordinator:
             job.error = f"오더 전송 확인 필요: {exc}"
             self._store.save(job)
         log.info("job 디스패치: %s -> %s (노드 %d개)", job_id, target_robot, len(order.nodes))
-        self._event("job.assigned", job, nodes=len(order.nodes), waited=self._since(job.created_at))
+        self._event("job.assigned", job, nodes=len(order.nodes), waited=self._since(job.created_at),
+                    reroutes=job.reroutes, snapshot=snapshot)
         return job
 
     # -- 다층 job ----------------------------------------------------
@@ -752,7 +767,8 @@ class JobCoordinator:
         job.touch()
         self._store.save(job)
         log.info("다층 job 디스패치: %s -> %s (stage %d개)", job.job_id, robot_id, len(plan))
-        self._event("job.assigned", job, stages=len(plan), waited=self._since(job.created_at))
+        self._event("job.assigned", job, stages=len(plan), waited=self._since(job.created_at),
+                    snapshot=self._assign_snapshot(job, rec.state) if rec and rec.state else None)
         self._step_multi(job)
         return job
 
@@ -794,6 +810,7 @@ class JobCoordinator:
     def _advance_stage(self, job: Job) -> bool:
         if job.stage < len(job.plan) and job.plan[job.stage]['t'] == 'order':
             # 끝난 오더의 허가를 호출/탑승/맵 전환 단계에서 다시 획득하지 않는다.
+            self.traffic.end_wait(job, "stage")
             job.traffic = {}
         job.stage += 1
         job.stage_data = {}
@@ -1570,6 +1587,7 @@ class JobCoordinator:
     def _finish(self, job: Job, status: JobStatus, error: Optional[str]) -> None:
         job.status = status
         job.error = error
+        self.traffic.end_wait(job, status.value)   # 대기 중 끝난 작업의 대기 구간을 닫는다
         if job.plan:
             self._release_elevators(job)
         job.touch()

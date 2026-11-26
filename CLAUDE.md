@@ -22,7 +22,7 @@ AMR 플릿 관리 서버(FMS, Python/FastAPI). 2026-11-08 에 makerton(대회 �
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # Python 3.11+
 .venv/bin/uvicorn fms_server.main:app --host 127.0.0.1 --port 8000   # UI: / , API 문서: /docs , 상태: /health
-.venv/bin/python -m pytest fms_server/tests/ -q                      # 전체 (300개, 약 7분)
+.venv/bin/python -m pytest fms_server/tests/ -q                      # 전체 (321개, 약 11분)
 .venv/bin/python -m pytest fms_server/tests/test_task.py -q          # 파일 하나
 .venv/bin/python -m pytest fms_server/tests/test_task.py::test_이름 -q   # 테스트 하나 (-k 패턴도 가능)
 node --test fms_server/tests/zone-geometry.test.js                   # JS 기하 테스트

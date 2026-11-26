@@ -72,7 +72,8 @@ def _apply(b: dict, event: dict) -> None:
     elif kind == "robot.charging_started":
         b["charges"] += 1
     elif kind == "traffic.wait_end":
-        if data.get("seconds") is not None:
+        # approach 는 대기 node 로 주행 중인 구간이라 서서 기다린 시간이 아니다.
+        if data.get("seconds") is not None and data.get("phase") != "approach":
             b["traffic_wait"][0] += data["seconds"]
             b["traffic_wait"][1] += 1
     elif kind == "traffic.deadlock":

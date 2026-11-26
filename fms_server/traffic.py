@@ -9,6 +9,7 @@ import heapq
 import json
 import math
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,9 @@ STALL_DISTANCE = 0.3          # m
 STALL_WAIT_SECONDS = 180.0    # BUSY/WAITING 이 이 시간을 넘으면 정체
 CONFLICT_LOOKAHEAD = 5.0      # 경로 교차 예고: 앞으로 이 시간(초) 안에 지나갈 경로만 본다
 CONFLICT_MIN_SPEED = 0.3      # 남은 경로 길이를 정할 때 쓰는 최소 속도 (m/s)
+PASS_HISTORY = 10            # 존 통과 시간 평균에 쓰는 최근 통과 수 (배정 스냅샷 avg_pass_s)
+ENTRY_WINDOW = 180.0         # 존 진입 시각을 이 시간(초)만큼 기억한다 (entries_1m/3m)
+BEFORE_WAIT = ("대기 node 사용 중", "대기 node 주변 확인 대기")
 
 
 def find_cycles(edges):
@@ -239,6 +243,7 @@ class TrafficController:
         self._deadlocks = {}          # frozenset(로봇) -> 처음 본 시각 (같은 순환을 반복 기록하지 않는다)
         self._conflicts = {}          # (로봇 a, 로봇 b) -> {since, last, paused}
         self.analysis = {"edges": [], "deadlocks": [], "stalls": [], "conflicts": []}
+        self._zone_hist = {}          # 존 예약 키 -> {entries: 진입 시각, passes: 통과 초} (메모리, 재시작 시 비움)
         self.path = Path(registry._sites_root).parent / "traffic.json"
         self.data = (json.loads(self.path.read_text()) if self.path.exists()
                      else {"limits": {}, "leases": {}})
@@ -252,21 +257,109 @@ class TrafficController:
         self.events.record(kind, site_id=site, robot_id=lease.get("robot"), job_id=lease.get("job"),
                            resource=resource, lease_kind=lease.get("kind"), **data)
 
-    def set_waiting(self, job, reason):
-        """대기 이유를 바꾸고, 대기 시작·해제를 이벤트로 남긴다."""
-        previous = job.traffic.get("waiting")
+    def set_waiting(self, job, reason, crossing=None, phase=None):
+        """대기 이유를 바꾸고, 대기 구간이 바뀔 때마다 이벤트로 남긴다.
+
+        구간 하나 = `traffic.wait`(시작) + `traffic.wait_end`(끝, seconds). 이유가 같아도 존·gate·단계가 바뀌면
+        새 구간이다 (예전에는 이유가 바뀌어도 한 번으로 합쳐졌고, 첫 대기는 기록되지 않았다).
+        phase: approach(대기 node 로 주행 중 — 서 있지 않다) / at_wait(대기 node 에 정지) /
+        before_wait(대기 node 앞에서 멈춤) / floor(층 정원) / map(맵·위치 확인).
+        """
         job.traffic["waiting"] = reason
-        if self.events is None or previous == reason:
+        job.traffic.pop("waiting_since", None)   # 예전 형식
+        key = None
+        if reason:
+            key = [reason, crossing["zone"] if crossing else None, crossing["gate"] if crossing else None, phase]
+        seg = job.traffic.get("wait_seg")
+        if seg is not None and seg["key"] == key:
             return
-        if reason and not previous:
-            job.traffic["waiting_since"] = time.time()
-            self.events.record("traffic.wait", site_id=job.site_id, robot_id=job.robot_id,
-                               job_id=job.job_id, reason=reason)
-        elif previous and not reason:
-            since = job.traffic.pop("waiting_since", None)
-            self.events.record("traffic.wait_end", site_id=job.site_id, robot_id=job.robot_id,
-                               job_id=job.job_id, reason=previous,
-                               seconds=round(time.time() - since, 2) if since else None)
+        now = time.time()
+        if seg is not None:
+            self._end_segment(job, seg, now, "next" if reason else "clear")
+        if reason:
+            job.traffic["wait_seg"] = {"key": key, "since": now}
+            self._wait_event("traffic.wait", job, key, ts=now)
+
+    def end_wait(self, job, outcome):
+        """열린 대기 구간을 닫는다 (작업 종료·오더 재구성·단계 전환). 대기 이유 표시는 그대로 둔다."""
+        seg = (job.traffic or {}).get("wait_seg")
+        if seg is not None:
+            self._end_segment(job, seg, time.time(), outcome)
+
+    def _end_segment(self, job, seg, now, outcome):
+        job.traffic.pop("wait_seg", None)
+        self._wait_event("traffic.wait_end", job, seg["key"], ts=now,
+                         seconds=round(now - seg["since"], 2), outcome=outcome)
+
+    def _wait_event(self, kind, job, key, **data):
+        if self.events is None:
+            return
+        reason, zone, gate, phase = key
+        self.events.record(kind, site_id=job.site_id, robot_id=job.robot_id, job_id=job.job_id,
+                           reason=reason, zone_id=zone, gate_id=gate, phase=phase, **data)
+
+    def _zone_entered(self, zone_key, now):
+        hist = self._zone_hist.setdefault(zone_key, {"entries": deque(), "passes": deque(maxlen=PASS_HISTORY)})
+        hist["entries"].append(now)
+        while hist["entries"] and hist["entries"][0] < now - ENTRY_WINDOW:
+            hist["entries"].popleft()
+
+    def _zone_passed(self, zone_key, seconds):
+        hist = self._zone_hist.setdefault(zone_key, {"entries": deque(), "passes": deque(maxlen=PASS_HISTORY)})
+        hist["passes"].append(seconds)
+
+    @staticmethod
+    def _current(job):
+        return next((c for c in (job.traffic or {}).get("crossings", []) if not c["done"]), None)
+
+    def assign_snapshot(self, job, state, now=None):
+        """배정 순간 FMS 가 알던 교통 상태. `job.assigned` 이벤트의 `snapshot` 으로 남긴다.
+
+        AI 학습 특징(설계서 표 3.6)의 원본이자 누출 검사 대조값이다. `prepare` 뒤(이 작업의 존 목록이 정해진 뒤),
+        `update` 앞(이 작업이 예약을 잡기 전)에 부른다. 이 작업 자신은 집계에서 뺀다.
+        """
+        now = time.time() if now is None else now
+        snap = {"t": round(now, 3), "soc": round(state.battery.charge, 2),
+                "x": round(state.pose.x, 3), "y": round(state.pose.y, 3), "zones": []}
+        t = job.traffic or {}
+        if not t:
+            return snap
+        key, leases = t["map"], self.data["leases"]
+        snap["moving_robots"] = len({v["robot"] for v in leases.values()
+                                     if v["kind"] == "floor" and v["map"] == key and not v.get("future")
+                                     and v["robot"] != job.robot_id})
+        snap["floor_cap"] = self.limit(job.site_id, t["map_id"])
+        others = [j for j in self.jobs.list(job.site_id)
+                  if j.job_id != job.job_id and not j.status.terminal and j.robot_id
+                  and j.traffic and j.traffic.get("map") == key]
+        for c in t.get("crossings", []):
+            zk = f'zone:{key}:{c["zone"]}'
+            queue = dir_queue = before_wait = ahead = 0
+            for j in others:
+                if any(cc["zone"] == c["zone"] and not cc["done"] for cc in j.traffic.get("crossings", [])):
+                    ahead += 1
+                cur = self._current(j)
+                if cur is None or cur["zone"] != c["zone"]:
+                    continue
+                owns = leases.get(zk, {}).get("job") == j.job_id
+                if cur.get("arrived") and not owns:
+                    queue += 1
+                    dir_queue += cur["gate"] == c["gate"]
+                elif j.traffic.get("waiting") in BEFORE_WAIT:
+                    before_wait += 1
+            hist = self._zone_hist.get(zk, {"entries": (), "passes": ()})
+            lease = leases.get(zk)
+            snap["zones"].append({
+                "zone_id": c["zone"], "gate_id": c["gate"],
+                "queue_len": queue, "queue_len_dir": dir_queue, "before_wait": before_wait,
+                "reserved_ahead": ahead,
+                "occupied": lease is not None,
+                "occ_elapsed_s": round(now - lease["at"], 2) if lease else None,
+                "entries_1m": sum(1 for e in hist["entries"] if e >= now - 60),
+                "entries_3m": sum(1 for e in hist["entries"] if e >= now - 180),
+                "avg_pass_s": round(sum(hist["passes"]) / len(hist["passes"]), 2) if hist["passes"] else None,
+                "passes_n": len(hist["passes"])})
+        return snap
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -334,6 +427,8 @@ class TrafficController:
                             and not j.status.terminal and j.traffic.get("waiting")]}
 
     def prepare(self, job, order, map_id, state):
+        if job.traffic:
+            self.end_wait(job, "reorder")   # 재경로·다층 단계로 오더를 새로 만들면 이전 대기 구간은 끝난다
         store = self.registry.map_store(job.site_id)
         version = store.active_version(map_id)
         zones = [z for z in store.load_annotations(map_id, version).zones if z.type == ZoneType.OCCUPANCY]
@@ -541,7 +636,10 @@ class TrafficController:
                     changed = True
                 clear = stopped and (j.status.terminal or (not lease.get("future") and lease.get("ack")))
             if clear:
-                self._event("traffic.release", lease, key)
+                held = round(time.time() - lease["at"], 2)
+                if lease["kind"] == "zone":
+                    self._zone_passed(key, held)   # 진입 허가 -> 출구 통과 (avg_pass_s)
+                self._event("traffic.release", lease, key, held_s=held)
                 del self.data["leases"][key]
                 changed = True
                 if lease.get("door") and self.doors is not None:
@@ -560,10 +658,10 @@ class TrafficController:
             return None
         s = r.state
         if s.map_id != t["uid"] or s.map_version != t["version"]:
-            self.set_waiting(job, "맵·위치 확인 대기")
+            self.set_waiting(job, "맵·위치 확인 대기", phase="map")
             return None
         if not self.acquire_floor(job, t["map_id"]):
-            self.set_waiting(job, "층별 동시 이동 대수 제한")
+            self.set_waiting(job, "층별 동시 이동 대수 제한", phase="floor")
             return None
         from common.schemas import Order
         order = Order.model_validate(job.order_snapshot)
@@ -588,21 +686,30 @@ class TrafficController:
             held = leases.get(wk)
             if held and (held["robot"] != job.robot_id or held.get("order") != order.order_id):
                 through = c["wait"]-1
-                self.set_waiting(job, "대기 node 사용 중")
+                self.set_waiting(job, "대기 node 사용 중", c, "before_wait")
                 break
             if not held:
                 if not self._clear_space(job, wait.position, radius(s)):
                     through = c["wait"]-1
-                    self.set_waiting(job, "대기 node 주변 확인 대기")
+                    self.set_waiting(job, "대기 node 주변 확인 대기", c, "before_wait")
                     break
                 leases[wk] = {"map": t["map"], "robot": job.robot_id, "job": job.job_id,
                               "kind": "wait", "at": time.time(), "order": order.order_id,
                               "pose": wait.position.model_dump(), "radius": radius(s),
                               "exit_id": order.nodes[c["exit"]].node_id, "exit": c["exit"], "update": order.order_update_id}
                 self.save()
-                self._event("traffic.reserve", leases[wk], wk)
+                self._event("traffic.reserve", leases[wk], wk, zone_id=c["zone"], gate_id=c["gate"])
             at_wait = (s.order_id == order.order_id and s.last_node_id == wait.node_id
                        and abs(s.velocity) < 0.01 and math.hypot(s.pose.x-wait.position.x,s.pose.y-wait.position.y) < 0.08)
+            if at_wait and not c.get("arrived"):
+                # 대기 node 에 처음 멈춘 시각. 존 대기 시간(학습 라벨)은 여기서 진입 허가까지다.
+                c["arrived"] = time.time()
+                if self.events is not None:
+                    reserved = leases.get(wk, {}).get("at")
+                    self.events.record("traffic.at_wait", site_id=job.site_id, robot_id=job.robot_id,
+                                       job_id=job.job_id, ts=c["arrived"], zone_id=c["zone"], gate_id=c["gate"],
+                                       approach_s=round(c["arrived"] - reserved, 2) if reserved else None,
+                                       zone_busy=zk in leases)
             end = order.nodes[c["exit"]]
             door = c.get("door")
             ready = (at_wait and zk not in leases and self._zone_clear(job, c)
@@ -611,7 +718,7 @@ class TrafficController:
                 # 자동문: 대기(진입) node 에서 열림 신호를 보내고, 열린 것을 확인해야 존에 들어간다.
                 if not self._door_open(job, door):
                     through = c["wait"]
-                    self.set_waiting(job, self.doors.reason(door) if self.doors else "자동문 제어기 없음")
+                    self.set_waiting(job, self.doors.reason(door) if self.doors else "자동문 제어기 없음", c, "at_wait")
                     break
             if ready:
                 leases[zk] = {"map": t["map"], "robot": job.robot_id, "job": job.job_id,
@@ -620,12 +727,15 @@ class TrafficController:
                               "exit_id": end.node_id, "exit": c["exit"], "bounds": c["bounds"],
                               "update": order.order_update_id+1, "door": door}
                 self.save()
-                self._event("traffic.reserve", leases[zk], zk)
+                now = leases[zk]["at"]
+                self._event("traffic.reserve", leases[zk], zk, zone_id=c["zone"], gate_id=c["gate"],
+                            queued_s=round(now - c["arrived"], 2) if c.get("arrived") else None)
+                self._zone_entered(zk, now)
                 through = c["exit"]
                 self.set_waiting(job, None)
             else:
                 through = c["wait"]
-                self.set_waiting(job, "점유 존 진입 허가 대기")
+                self.set_waiting(job, "점유 존 진입 허가 대기", c, "at_wait" if at_wait else "approach")
             break
         else:
             self.set_waiting(job, None)
